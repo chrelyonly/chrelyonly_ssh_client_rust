@@ -4,12 +4,11 @@ use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
 use chrono::Utc;
-use dirs::{data_local_dir, home_dir};
 use serde::Serialize;
 
+use crate::config::paths::{data_dir, legacy_data_dir};
 use crate::config::server::Server;
 
-const APP_DIR_NAME: &str = "rustssh_manager";
 const AUDIT_LOG_FILE: &str = "audit.log";
 
 static AUDIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -72,11 +71,11 @@ fn append_record(record: AuditRecord<'_>) {
 }
 
 pub fn audit_log_path() -> PathBuf {
-    data_local_dir()
-        .or_else(home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(APP_DIR_NAME)
-        .join(AUDIT_LOG_FILE)
+    data_dir().join(AUDIT_LOG_FILE)
+}
+
+pub fn legacy_audit_log_path() -> PathBuf {
+    legacy_data_dir().join(AUDIT_LOG_FILE)
 }
 
 fn summarize_command(command: &str) -> String {

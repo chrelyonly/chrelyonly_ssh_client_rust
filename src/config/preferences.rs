@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-use dirs::{config_dir, home_dir};
 use serde::{Deserialize, Serialize};
 
-const APP_DIR_NAME: &str = "rustssh_manager";
 const SETTINGS_FILE_NAME: &str = "app_settings.json";
+
+use crate::config::paths::{config_dir, legacy_config_dir};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -19,17 +19,17 @@ pub enum ThemePreset {
 impl ThemePreset {
     pub fn label(self) -> &'static str {
         match self {
-            Self::PeachBlossom => "夜樱墨",
-            Self::Celadon => "青瓷夜",
-            Self::Vermilion => "朱砂夜",
+            Self::PeachBlossom => "莓雾粉夜",
+            Self::Celadon => "青瓷薄雾",
+            Self::Vermilion => "朱砂暖夜",
         }
     }
 
     pub fn subtitle(self) -> &'static str {
         match self {
-            Self::PeachBlossom => "偏可爱的粉墨夜色，柔和又有一点氛围感。",
-            Self::Celadon => "冷静通透的青绿夜幕，适合长时间盯着终端。",
-            Self::Vermilion => "更有层次的暖墨暗调，重点信息会更醒目。",
+            Self::PeachBlossom => "偏柔和的莓粉夜色，轻盈、通透，适合日常连接与浏览。",
+            Self::Celadon => "冷静通透的青绿玻璃感，更适合长时间盯着终端工作。",
+            Self::Vermilion => "带一点暖调层次的深色界面，重点信息会更醒目。",
         }
     }
 }
@@ -54,20 +54,25 @@ impl Default for AppSettings {
 
 fn app_config_dir() -> PathBuf {
     config_dir()
-        .or_else(home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(APP_DIR_NAME)
 }
 
 fn settings_path() -> PathBuf {
     app_config_dir().join(SETTINGS_FILE_NAME)
 }
 
+fn legacy_settings_path() -> PathBuf {
+    legacy_config_dir().join(SETTINGS_FILE_NAME)
+}
+
 pub fn load_settings() -> AppSettings {
-    let path = settings_path();
-    let data = match fs::read_to_string(&path) {
-        Ok(data) => data,
-        Err(_) => return AppSettings::default(),
+    let primary = settings_path();
+    let legacy = legacy_settings_path();
+    let (path, data) = match fs::read_to_string(&primary) {
+        Ok(data) => (primary, data),
+        Err(_) => match fs::read_to_string(&legacy) {
+            Ok(data) => (legacy, data),
+            Err(_) => return AppSettings::default(),
+        },
     };
 
     match serde_json::from_str::<AppSettings>(&data) {

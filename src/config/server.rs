@@ -14,7 +14,7 @@ impl AuthMethod {
     pub fn label(self) -> &'static str {
         match self {
             Self::Password => "密码",
-            Self::PrivateKey => "私钥",
+            Self::PrivateKey => "密钥",
         }
     }
 }
@@ -58,11 +58,11 @@ impl ConnectionPolicy {
     pub fn summary(&self) -> String {
         if self.auto_reconnect {
             format!(
-                "自动重连：{} 次 / {} 秒退避 / {} 秒超时",
+                "自动重连：最多 {} 次 / 退避 {} 秒 / 超时 {} 秒",
                 self.max_reconnect_attempts, self.reconnect_backoff_secs, self.connect_timeout_secs
             )
         } else {
-            format!("自动重连：关闭 / {} 秒超时", self.connect_timeout_secs)
+            format!("自动重连：关闭 / 超时 {} 秒", self.connect_timeout_secs)
         }
     }
 }

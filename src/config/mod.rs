@@ -1,3 +1,4 @@
+pub mod paths;
 pub mod preferences;
 pub mod server;
 pub mod storage;

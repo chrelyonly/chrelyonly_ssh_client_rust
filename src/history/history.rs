@@ -4,13 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dirs::{data_local_dir, home_dir};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::config::paths::{data_dir, legacy_data_dir};
 use crate::config::server::Server;
 
-const APP_DIR_NAME: &str = "rustssh_manager";
 const CONNECTION_HISTORY_FILE: &str = "connection_history.json";
 const COMMAND_HISTORY_FILE: &str = "command_history.json";
 const SHORTCUTS_FILE: &str = "shortcuts.json";
@@ -111,10 +110,11 @@ impl ShortcutCommand {
 }
 
 fn app_data_dir() -> PathBuf {
-    data_local_dir()
-        .or_else(home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(APP_DIR_NAME)
+    data_dir()
+}
+
+fn legacy_path(file_name: &str) -> PathBuf {
+    legacy_data_dir().join(file_name)
 }
 
 fn connection_history_path() -> PathBuf {
@@ -140,13 +140,16 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
-fn load_json_vec<T>(path: &Path) -> Vec<T>
+fn load_json_vec<T>(primary: &Path, legacy: &Path) -> Vec<T>
 where
     T: DeserializeOwned,
 {
-    let data = match fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(_) => return vec![],
+    let (path, data) = match fs::read_to_string(primary) {
+        Ok(data) => (primary.to_path_buf(), data),
+        Err(_) => match fs::read_to_string(legacy) {
+            Ok(data) => (legacy.to_path_buf(), data),
+            Err(_) => return vec![],
+        },
     };
 
     match serde_json::from_str::<Vec<T>>(&data) {
@@ -183,7 +186,10 @@ where
 }
 
 pub fn load_connection_history() -> Vec<ConnectionHistory> {
-    load_json_vec(&connection_history_path())
+    load_json_vec(
+        &connection_history_path(),
+        &legacy_path(CONNECTION_HISTORY_FILE),
+    )
 }
 
 pub fn save_connection_history(history: &[ConnectionHistory]) {
@@ -220,7 +226,7 @@ pub fn recent_connections(limit: usize) -> Vec<ConnectionHistory> {
 }
 
 pub fn load_command_history() -> Vec<CommandHistory> {
-    load_json_vec(&command_history_path())
+    load_json_vec(&command_history_path(), &legacy_path(COMMAND_HISTORY_FILE))
 }
 
 pub fn save_command_history(history: &[CommandHistory]) {
@@ -246,7 +252,7 @@ pub fn recent_commands_for_host(host: &str, limit: usize) -> Vec<CommandHistory>
 }
 
 pub fn load_shortcuts() -> Vec<ShortcutCommand> {
-    load_json_vec(&shortcuts_path())
+    load_json_vec(&shortcuts_path(), &legacy_path(SHORTCUTS_FILE))
 }
 
 pub fn save_shortcuts(shortcuts: &[ShortcutCommand]) {
@@ -270,7 +276,7 @@ pub fn remove_shortcut(name: &str) {
 }
 
 pub fn load_scripts() -> Vec<Script> {
-    load_json_vec(&scripts_path())
+    load_json_vec(&scripts_path(), &legacy_path(SCRIPTS_FILE))
 }
 
 pub fn save_scripts(scripts: &[Script]) {

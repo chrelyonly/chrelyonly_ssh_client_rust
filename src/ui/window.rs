@@ -16,7 +16,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::audit::log::{append_command_event, append_server_event, audit_log_path};
+use crate::audit::log::{
+    append_command_event, append_server_event, audit_log_path, legacy_audit_log_path,
+};
+use crate::config::paths::{data_dir, temp_dir};
 use crate::config::preferences::{AppSettings, ThemePreset, load_settings, save_settings};
 use crate::config::server::{AuthMethod, ConnectionPolicy, DEFAULT_GROUP_NAME, Server};
 use crate::config::storage::save_servers;
@@ -573,6 +576,53 @@ impl HomePage {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppPage {
+    Terminal,
+    Connections,
+    Settings,
+    Config,
+}
+
+impl AppPage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "终端",
+            Self::Connections => "连接",
+            Self::Settings => "设置",
+            Self::Config => "配置",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalWorkbenchTab {
+    SplitTerminal,
+    Vault,
+    Sftp,
+    Theme,
+}
+
+impl TerminalWorkbenchTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SplitTerminal => "终端会话",
+            Self::Vault => "连接资料",
+            Self::Sftp => "SFTP",
+            Self::Theme => "自定义主题",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::SplitTerminal => "SSH 会话、标签切换与终端操作",
+            Self::Vault => "连接信息、命令记录与审计资料",
+            Self::Sftp => "远程文件浏览、上传下载与整理",
+            Self::Theme => "统一控制 SSH 客户端的视觉风格",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ThemePalette {
     background_top: Color32,
@@ -618,9 +668,9 @@ impl ThemePalette {
                 warning: Color32::from_rgb(240, 203, 132),
                 danger: Color32::from_rgb(244, 142, 159),
                 shadow: Color32::from_rgba_premultiplied(7, 15, 33, 88),
-                terminal_bg: Color32::from_rgba_premultiplied(7, 14, 26, 196),
-                terminal_border: Color32::from_rgba_premultiplied(208, 229, 255, 74),
-                terminal_text: Color32::from_rgb(242, 247, 255),
+                terminal_bg: Color32::from_rgba_premultiplied(8, 12, 26, 236),
+                terminal_border: Color32::from_rgba_premultiplied(126, 156, 198, 58),
+                terminal_text: Color32::from_rgb(128, 231, 178),
             },
             ThemePreset::Celadon => Self {
                 background_top: Color32::from_rgb(19, 40, 41),
@@ -640,9 +690,9 @@ impl ThemePalette {
                 warning: Color32::from_rgb(237, 206, 138),
                 danger: Color32::from_rgb(237, 146, 145),
                 shadow: Color32::from_rgba_premultiplied(6, 18, 19, 84),
-                terminal_bg: Color32::from_rgba_premultiplied(7, 17, 18, 194),
-                terminal_border: Color32::from_rgba_premultiplied(206, 244, 232, 72),
-                terminal_text: Color32::from_rgb(242, 248, 246),
+                terminal_bg: Color32::from_rgba_premultiplied(8, 12, 24, 236),
+                terminal_border: Color32::from_rgba_premultiplied(110, 170, 154, 56),
+                terminal_text: Color32::from_rgb(125, 231, 180),
             },
             ThemePreset::Vermilion => Self {
                 background_top: Color32::from_rgb(47, 34, 29),
@@ -662,9 +712,9 @@ impl ThemePalette {
                 warning: Color32::from_rgb(244, 206, 135),
                 danger: Color32::from_rgb(244, 145, 130),
                 shadow: Color32::from_rgba_premultiplied(24, 14, 10, 82),
-                terminal_bg: Color32::from_rgba_premultiplied(22, 14, 12, 192),
-                terminal_border: Color32::from_rgba_premultiplied(255, 230, 205, 72),
-                terminal_text: Color32::from_rgb(248, 244, 239),
+                terminal_bg: Color32::from_rgba_premultiplied(10, 12, 24, 236),
+                terminal_border: Color32::from_rgba_premultiplied(162, 147, 128, 58),
+                terminal_text: Color32::from_rgb(131, 227, 179),
             },
         }
     }
@@ -694,6 +744,8 @@ pub struct App {
     show_server_editor_dialog: bool,
     auth_prompt_dialog: Option<AuthPromptDialog>,
     pending_delete_server: Option<Server>,
+    app_page: AppPage,
+    terminal_workbench_tab: TerminalWorkbenchTab,
     home_page: HomePage,
     resource_tab: ResourceTab,
     file_transfer: FileTransferPanel,
@@ -701,6 +753,7 @@ pub struct App {
     file_transfer_events: UnboundedReceiver<FileTransferEvent>,
     workspace_path: String,
     audit_entries: Vec<String>,
+    terminal_focus_tab_id: Option<usize>,
     has_display_font: bool,
     background_texture: Option<egui::TextureHandle>,
 }
@@ -750,6 +803,8 @@ impl App {
             show_server_editor_dialog: false,
             auth_prompt_dialog: None,
             pending_delete_server: None,
+            app_page: AppPage::Connections,
+            terminal_workbench_tab: TerminalWorkbenchTab::SplitTerminal,
             home_page: HomePage::Hosts,
             resource_tab: ResourceTab::Commands,
             file_transfer: FileTransferPanel::new(),
@@ -757,6 +812,7 @@ impl App {
             file_transfer_events,
             workspace_path: default_workspace_path().display().to_string(),
             audit_entries: load_recent_audit_entries(24),
+            terminal_focus_tab_id: None,
             has_display_font,
             background_texture,
             settings,
@@ -844,6 +900,10 @@ impl App {
             || self.show_server_editor_dialog
             || self.auth_prompt_dialog.is_some()
             || self.pending_delete_server.is_some()
+    }
+
+    fn has_blocking_modal_open(&self) -> bool {
+        self.auth_prompt_dialog.is_some() || self.pending_delete_server.is_some()
     }
 
     fn sort_servers(&mut self) {
@@ -1669,6 +1729,7 @@ impl App {
         self.tabs.push(tab);
         self.active_tab = self.tabs.len().saturating_sub(1);
         self.resource_tab = ResourceTab::Commands;
+        self.app_page = AppPage::Terminal;
     }
 
     #[allow(unreachable_code)]
@@ -1715,7 +1776,10 @@ impl App {
             let _ = session.disconnect();
         }
         if index < self.tabs.len() {
-            self.tabs.remove(index);
+            let removed = self.tabs.remove(index);
+            if self.terminal_focus_tab_id == Some(removed.id) {
+                self.terminal_focus_tab_id = None;
+            }
         }
 
         if self.tabs.is_empty() {
@@ -1804,7 +1868,7 @@ impl App {
                 tab.connected_at = None;
                 tab.retry_delay_secs = None;
                 tab.status_text = message.clone();
-                tab.push_system_message(&format!("ERROR: {message}"));
+                tab.push_system_message(&format!("错误: {message}"));
                 clear_auth_prompt = true;
                 if !is_active {
                     tab.unseen_output = true;
@@ -1871,7 +1935,7 @@ impl App {
                 true
             }
             Err(error) => {
-                let message = format!("Failed to send terminal input: {error}");
+                let message = format!("发送终端输入失败: {error}");
                 self.tabs[tab_index].push_system_message(&message);
                 self.set_flash(message, true);
                 false
@@ -1897,6 +1961,15 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(tab_index) {
             tab.history_cursor = None;
             tab.input_buffer.clear();
+        }
+    }
+
+    fn echo_terminal_interrupt(&mut self, tab_index: usize) {
+        if let Some(tab) = self.tabs.get_mut(tab_index) {
+            tab.history_cursor = None;
+            tab.input_buffer.clear();
+            tab.push_output("^C\n");
+            tab.auto_scroll = true;
         }
     }
 
@@ -1963,6 +2036,10 @@ impl App {
                         continue;
                     }
 
+                    if modifiers.ctrl && key == egui::Key::C {
+                        self.echo_terminal_interrupt(tab_index);
+                    }
+
                     match key {
                         egui::Key::Enter => self.commit_tracked_terminal_command(tab_index),
                         egui::Key::Backspace => self.pop_tracked_terminal_text(tab_index),
@@ -2011,9 +2088,9 @@ impl App {
                         })
                         .count();
 
-                    ui.horizontal_wrapped(|ui| {
+                    ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("墨园 SSH")
+                            RichText::new("莓莓SSH终端")
                                 .font(self.display_font(28.0))
                                 .color(palette.text_primary),
                         );
@@ -2067,7 +2144,14 @@ impl App {
                     });
 
                     if let Some(message) = &self.flash_message {
-                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("玻璃质感的 SSH 工作台")
+                                    .small()
+                                    .color(palette.text_muted),
+                            );
+                        });
+                        ui.add_space(12.0);
                         let fill = if message.is_error {
                             palette.danger.linear_multiply(0.18)
                         } else {
@@ -2110,7 +2194,7 @@ impl App {
 
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            RichText::new("墨园 SSH")
+                            RichText::new("莓莓SSH终端")
                                 .font(self.display_font(26.0))
                                 .color(palette.text_primary),
                         );
@@ -2136,7 +2220,7 @@ impl App {
                             self.resource_tab = ResourceTab::Workspace;
                         }
 
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
                         let mut selected_theme = self.settings.theme_preset;
                         egui::ComboBox::from_id_salt("theme_preset_compact")
                             .selected_text(selected_theme.label())
@@ -2169,7 +2253,9 @@ impl App {
                             palette.panel_alt,
                             palette.text_secondary,
                         );
-                    });
+                        });
+                        ui.add_space(2.0);
+                        ui.separator();
                 });
             });
     }
@@ -2189,8 +2275,10 @@ impl App {
             .collect();
 
         egui::SidePanel::left("servers_panel_clean")
-            .resizable(true)
+            .resizable(false)
             .default_width(292.0)
+            .min_width(292.0)
+            .max_width(292.0)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
                 ui.label(
@@ -2331,10 +2419,14 @@ impl App {
     ) {
         let active_index = self.active_tab;
         let title_font = self.display_font(28.0);
-        let terminal_widget_id =
-            ui.make_persistent_id(("terminal_surface", self.tabs[active_index].id));
-        let terminal_has_focus = ui.memory(|mem| mem.has_focus(terminal_widget_id));
+        let active_tab_id = self.tabs[active_index].id;
+        let terminal_widget_id = ui.make_persistent_id(("terminal_surface", active_tab_id));
+        let terminal_has_focus = self.terminal_focus_tab_id == Some(active_tab_id)
+            || ui.memory(|mem| mem.has_focus(terminal_widget_id));
         let mut should_handle_terminal_input = false;
+        let mut pending_interrupt_echo = false;
+        let mut pending_focus_terminal = false;
+        let mut terminal_interacted = false;
 
         {
             let tab = &mut self.tabs[active_index];
@@ -2364,7 +2456,7 @@ impl App {
                     stat_chip(ui, palette, "尝试", tab.connection_attempt.to_string());
                     stat_chip(ui, palette, "重连", tab.reconnect_count.to_string());
                     stat_chip(ui, palette, "在线时长", tab.uptime_text());
-                    stat_chip(ui, palette, "SHELL", tab.terminal_identity());
+                    stat_chip(ui, palette, "终端", tab.terminal_identity());
                     if let Some(delay_secs) = tab.retry_delay_secs {
                         stat_chip(ui, palette, "退避", format!("{delay_secs}s"));
                     }
@@ -2456,6 +2548,8 @@ impl App {
                             if terminal_response.clicked() || terminal_response.drag_started() {
                                 ui.memory_mut(|mem| mem.request_focus(terminal_widget_id));
                                 tab.auto_scroll = true;
+                                pending_focus_terminal = true;
+                                terminal_interacted = true;
                             }
                         });
 
@@ -2465,8 +2559,13 @@ impl App {
                     if response.clicked() {
                         ui.memory_mut(|mem| mem.request_focus(terminal_widget_id));
                         tab.auto_scroll = true;
+                        pending_focus_terminal = true;
+                        terminal_interacted = true;
                     }
-                    should_handle_terminal_input = response.has_focus();
+                    should_handle_terminal_input = terminal_has_focus || response.has_focus();
+                    if should_handle_terminal_input {
+                        ui.memory_mut(|mem| mem.request_focus(terminal_widget_id));
+                    }
                 });
 
             card_frame(palette, palette.panel_soft, 12).show(ui, |ui| {
@@ -2491,7 +2590,7 @@ impl App {
                     }
                     if ui.button("发送 Ctrl+C").clicked() {
                         match tab.session.interrupt() {
-                            Ok(()) => tab.push_system_message("已向远端 Shell 发送 Ctrl+C。"),
+                            Ok(()) => pending_interrupt_echo = true,
                             Err(error) => {
                                 tab.push_system_message(&format!("发送 Ctrl+C 失败: {error}"))
                             }
@@ -2515,15 +2614,266 @@ impl App {
                     );
                     ui.label(
                         RichText::new(if terminal_has_focus {
-                            "Terminal focused: type directly here"
+                            "终端已聚焦，可直接输入"
                         } else {
-                            "Click inside the terminal to type directly"
+                            "点击终端区域后可直接输入"
                         })
                         .small()
                         .color(palette.text_secondary),
                     );
                 });
             });
+        }
+
+        if pending_interrupt_echo {
+            self.echo_terminal_interrupt(active_index);
+        }
+
+        if pending_focus_terminal {
+            self.terminal_focus_tab_id = Some(active_tab_id);
+        } else if ctx.input(|input| input.pointer.any_click()) && !terminal_interacted {
+            self.terminal_focus_tab_id = None;
+        }
+
+        if should_handle_terminal_input {
+            self.handle_terminal_input(ctx, active_index);
+        }
+    }
+
+    fn draw_terminal_shell_modern(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        _pending_send_command: &mut Option<String>,
+        pending_restart_active_tab: &mut bool,
+        _pending_pin_shortcut: &mut Option<String>,
+        palette: &ThemePalette,
+    ) {
+        let active_index = self.active_tab;
+        let active_tab_id = self.tabs[active_index].id;
+        let terminal_widget_id = ui.make_persistent_id(("terminal_surface_modern", active_tab_id));
+        let terminal_has_focus = self.terminal_focus_tab_id == Some(active_tab_id)
+            || ui.memory(|mem| mem.has_focus(terminal_widget_id));
+        let mut should_handle_terminal_input = false;
+        let mut pending_interrupt_echo = false;
+        let mut pending_focus_terminal = false;
+        let mut terminal_interacted = false;
+
+        {
+            let tab = &mut self.tabs[active_index];
+            tab.unseen_output = false;
+
+            let available_height = ui.available_height();
+            let terminal_height = available_height.max(340.0);
+            let full_size = ui.available_size_before_wrap();
+            let viewport_height = (terminal_height - 86.0).max(260.0);
+            let cols = ((full_size.x.max(680.0) / 8.2).floor() as u32).max(DEFAULT_TERMINAL_COLS);
+            let rows = ((viewport_height / 16.2).floor() as u32).max(DEFAULT_TERMINAL_ROWS);
+            let desired = (cols, rows);
+            if tab.last_terminal_size != Some(desired) {
+                match tab.session.resize(desired.0, desired.1, full_size.x as u32, terminal_height as u32)
+                {
+                    Ok(()) => tab.last_terminal_size = Some(desired),
+                    Err(error) => tab.push_system_message(&format!("调整终端尺寸失败: {error}")),
+                }
+            }
+
+            let terminal_identity = tab.terminal_identity();
+            let show_cursor = terminal_has_focus
+                && matches!(tab.state, TabState::Connected)
+                && ((ctx.input(|input| input.time) * 2.0).floor() as i64 % 2 == 0);
+            if terminal_has_focus {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+
+            egui::Frame::new()
+                .fill(palette.terminal_bg.linear_multiply(1.04))
+                .stroke(Stroke::new(
+                    if terminal_has_focus { 1.3 } else { 1.0 },
+                    if terminal_has_focus {
+                        palette.success.linear_multiply(0.94)
+                    } else {
+                        palette.terminal_border
+                    },
+                ))
+                .corner_radius(CornerRadius::same(22))
+                .inner_margin(Margin::same(0))
+                .shadow(Shadow {
+                    offset: [0, 18],
+                    blur: 42,
+                    spread: 0,
+                    color: palette.shadow,
+                })
+                .show(ui, |ui| {
+                    ui.set_min_height(terminal_height);
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_premultiplied(255, 255, 255, 8))
+                        .stroke(Stroke::new(0.0, Color32::TRANSPARENT))
+                        .inner_margin(Margin::symmetric(14, 10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("●").color(Color32::from_rgb(255, 105, 97)));
+                                ui.label(RichText::new("●").color(Color32::from_rgb(255, 189, 46)));
+                                ui.label(RichText::new("●").color(Color32::from_rgb(39, 201, 63)));
+                                ui.add_space(10.0);
+                                ui.label(
+                                    RichText::new(tab.server.endpoint())
+                                        .small()
+                                        .monospace()
+                                        .color(palette.text_secondary),
+                                );
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if terminal_toolbar_button(ui, palette, "断开").clicked() {
+                                            match tab.session.disconnect() {
+                                                Ok(()) => tab.push_system_message("已发起断开请求。"),
+                                                Err(error) => tab.push_system_message(&format!(
+                                                    "发起断开请求失败: {error}"
+                                                )),
+                                            }
+                                        }
+                                        if terminal_toolbar_button(ui, palette, "Ctrl+C").clicked() {
+                                            match tab.session.interrupt() {
+                                                Ok(()) => pending_interrupt_echo = true,
+                                                Err(error) => tab.push_system_message(&format!(
+                                                    "发送 Ctrl+C 失败: {error}"
+                                                )),
+                                            }
+                                        }
+                                        if terminal_toolbar_button(ui, palette, "重连").clicked() {
+                                            match tab.state {
+                                                TabState::Disconnected | TabState::Failed => {
+                                                    *pending_restart_active_tab = true;
+                                                }
+                                                TabState::Connecting
+                                                | TabState::Reconnecting
+                                                | TabState::Connected => match tab
+                                                    .session
+                                                    .reconnect_now()
+                                                {
+                                                    Ok(()) => tab.push_system_message("已发起重连请求。"),
+                                                    Err(error) => tab.push_system_message(&format!(
+                                                        "发起重连请求失败: {error}"
+                                                    )),
+                                                },
+                                            }
+                                        }
+                                        if terminal_toolbar_button(ui, palette, "清屏").clicked() {
+                                            tab.terminal_content.clear();
+                                        }
+                                        badge(
+                                            ui,
+                                            palette,
+                                            &tab.status_text,
+                                            tab.status_color(palette).linear_multiply(0.18),
+                                            tab.status_color(palette),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+
+                    ui.add_space(4.0);
+
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_premultiplied(0, 0, 0, 0))
+                        .inner_margin(Margin::symmetric(14, 10))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("terminal_scroll_modern", tab.id))
+                                .stick_to_bottom(tab.auto_scroll)
+                                .auto_shrink([false, false])
+                                .max_height(viewport_height)
+                                .show(ui, |ui| {
+                                    let mut layout_job = build_terminal_layout_job(
+                                        &tab.terminal_content,
+                                        palette,
+                                        &terminal_identity,
+                                        show_cursor,
+                                    );
+                                    layout_job.wrap.max_width = ui.available_width();
+                                    ui.set_width(ui.available_width());
+                                    let terminal_response = ui.add(
+                                        egui::Label::new(layout_job)
+                                            .selectable(true)
+                                            .sense(egui::Sense::click_and_drag()),
+                                    );
+                                    if terminal_response.clicked() || terminal_response.drag_started() {
+                                        ui.memory_mut(|mem| mem.request_focus(terminal_widget_id));
+                                        tab.auto_scroll = true;
+                                        pending_focus_terminal = true;
+                                        terminal_interacted = true;
+                                    }
+                                });
+                        });
+
+                    ui.add_space(2.0);
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_premultiplied(255, 255, 255, 6))
+                        .stroke(Stroke::new(0.0, Color32::TRANSPARENT))
+                        .inner_margin(Margin::symmetric(14, 8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut tab.auto_scroll, "自动跟随");
+                                ui.separator();
+                                ui.label(
+                                    RichText::new(if terminal_has_focus {
+                                        "终端已聚焦，可直接输入"
+                                    } else {
+                                        "点击终端区域后可直接输入"
+                                    })
+                                    .small()
+                                    .color(palette.text_muted),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(format!("会话 #{}", tab.id))
+                                                .small()
+                                                .monospace()
+                                                .color(palette.text_secondary),
+                                        );
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            RichText::new(&terminal_identity)
+                                                .small()
+                                                .monospace()
+                                                .color(palette.success),
+                                        );
+                                    },
+                                );
+                            });
+                        });
+
+                    let terminal_rect = ui.min_rect();
+                    let response =
+                        ui.interact(terminal_rect, terminal_widget_id, egui::Sense::click());
+                    if response.clicked() {
+                        ui.memory_mut(|mem| mem.request_focus(terminal_widget_id));
+                        tab.auto_scroll = true;
+                        pending_focus_terminal = true;
+                        terminal_interacted = true;
+                    }
+                    should_handle_terminal_input = terminal_has_focus || response.has_focus();
+                    if should_handle_terminal_input {
+                        ui.memory_mut(|mem| mem.request_focus(terminal_widget_id));
+                    }
+                });
+        }
+
+        if pending_interrupt_echo {
+            self.echo_terminal_interrupt(active_index);
+        }
+
+        if pending_focus_terminal {
+            self.terminal_focus_tab_id = Some(active_tab_id);
+        } else if ctx.input(|input| input.pointer.any_click()) && !terminal_interacted {
+            self.terminal_focus_tab_id = None;
         }
 
         if should_handle_terminal_input {
@@ -2572,6 +2922,7 @@ impl App {
         pending_run_command: &mut Option<String>,
         palette: &ThemePalette,
     ) {
+        let _ = pending_connect;
         let active_endpoint = self.tabs[self.active_tab].server.endpoint();
         let title_font = self.display_font(24.0);
         card_frame(palette, palette.panel, 14).show(ui, |ui| {
@@ -2594,8 +2945,6 @@ impl App {
                     ResourceTab::Overview,
                     ResourceTab::Files,
                     ResourceTab::Commands,
-                    ResourceTab::History,
-                    ResourceTab::Scripts,
                     ResourceTab::Audit,
                     ResourceTab::Workspace,
                 ] {
@@ -2612,15 +2961,86 @@ impl App {
             ResourceTab::Overview => self.draw_connection_overview_card(ui, palette),
             ResourceTab::Files => self.draw_file_transfer_card(ui, palette),
             ResourceTab::Commands => self.draw_quick_actions_card(ui, pending_run_command, palette),
-            ResourceTab::History => self.draw_history_card(ui, pending_connect, palette),
-            ResourceTab::Scripts => self.draw_script_center_card(ui, pending_run_command, palette),
+            ResourceTab::History | ResourceTab::Scripts => {
+                self.resource_tab = ResourceTab::Commands;
+                self.draw_quick_actions_card(ui, pending_run_command, palette);
+            }
             ResourceTab::Audit => self.draw_audit_card(ui, palette),
             ResourceTab::Workspace => self.draw_workspace_card(ui, ctx, palette),
         }
     }
 
     fn draw_shell_top_bar(&mut self, ctx: &egui::Context) {
-        self.draw_top_bar_compact(ctx);
+        let palette = self.palette();
+        egui::TopBottomPanel::top("primary_app_tabs")
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(palette.panel.linear_multiply(0.82))
+                    .stroke(Stroke::new(0.0, Color32::TRANSPARENT))
+                    .inner_margin(Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = vec2(12.0, 0.0);
+                        ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("莓莓SSH终端")
+                                    .font(self.display_font(24.0))
+                                    .color(palette.text_primary),
+                            );
+                            ui.label(
+                                RichText::new("面向 SSH 连接的现代桌面客户端")
+                                    .small()
+                                    .color(palette.text_muted),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        egui::ScrollArea::horizontal()
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for page in [
+                                        AppPage::Terminal,
+                                        AppPage::Connections,
+                                        AppPage::Settings,
+                                        AppPage::Config,
+                                    ] {
+                                        let selected = self.app_page == page;
+                                        if shell_pill(ui, &palette, page.label(), selected, 12, 7)
+                                            .clicked()
+                                        {
+                                            self.app_page = page;
+                                        }
+                                    }
+                                });
+                            });
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let connected_count = self
+                                    .tabs
+                                    .iter()
+                                    .filter(|tab| tab.state == TabState::Connected)
+                                    .count();
+                                badge(
+                                    ui,
+                                    &palette,
+                                    &format!("{connected_count} 在线"),
+                                    palette.accent_soft,
+                                    palette.text_primary,
+                                );
+                            },
+                        );
+                        ui.add_space(8.0);
+                        let rect = ui.max_rect();
+                        ui.painter().hline(
+                            rect.x_range(),
+                            rect.bottom() - 1.0,
+                            Stroke::new(1.0, palette.stroke.linear_multiply(0.36)),
+                        );
+                    });
+                });
+            });
     }
 
     fn draw_shell_sidebar(&mut self, ctx: &egui::Context, pending_connect: &mut Option<Server>) {
@@ -2694,26 +3114,45 @@ impl App {
                                 for index in 0..self.tabs.len() {
                                     let selected = index == self.active_tab;
                                     let title = self.tabs[index].title_for_tab();
+                                    let status_color = self.tabs[index].status_color(&palette);
+                                    let tab_fill = if selected {
+                                        palette.panel_alt.linear_multiply(1.18)
+                                    } else {
+                                        palette.panel.linear_multiply(0.96)
+                                    };
+                                    let tab_stroke = if selected {
+                                        palette.accent
+                                    } else {
+                                        palette.stroke.linear_multiply(0.9)
+                                    };
+                                    let title_color = if selected {
+                                        palette.text_primary
+                                    } else {
+                                        palette.text_secondary
+                                    };
+                                    let close_color = if selected {
+                                        palette.text_primary
+                                    } else {
+                                        palette.text_muted
+                                    };
                                     egui::Frame::new()
-                                        .fill(if selected {
-                                            palette.accent_soft
-                                        } else {
-                                            palette.panel_alt.linear_multiply(0.94)
-                                        })
-                                        .stroke(Stroke::new(
-                                            if selected { 1.35 } else { 1.0 },
-                                            if selected { palette.accent } else { palette.stroke },
-                                        ))
+                                        .fill(tab_fill)
+                                        .stroke(Stroke::new(if selected { 1.4 } else { 1.0 }, tab_stroke))
                                         .corner_radius(CornerRadius::same(16))
                                         .inner_margin(Margin::symmetric(12, 9))
                                         .show(ui, |ui| {
                                             ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new("●")
+                                                        .small()
+                                                        .color(status_color),
+                                                );
                                                 let response = ui.add(
                                                     egui::Button::new(
                                                         RichText::new(title)
                                                             .small()
                                                             .strong()
-                                                            .color(palette.text_primary),
+                                                            .color(title_color),
                                                     )
                                                     .frame(false),
                                                 );
@@ -2724,9 +3163,9 @@ impl App {
                                                 if ui
                                                     .add(
                                                         egui::Button::new(
-                                                            RichText::new("x")
+                                                            RichText::new("×")
                                                                 .small()
-                                                                .color(palette.text_muted),
+                                                                .color(close_color),
                                                         )
                                                         .frame(false),
                                                     )
@@ -2744,6 +3183,124 @@ impl App {
             });
     }
 
+    fn draw_global_tabs_bar_modern(
+        &mut self,
+        ctx: &egui::Context,
+        pending_close: &mut Option<usize>,
+    ) {
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        egui::TopBottomPanel::top("session_tabs_bar_modern")
+            .resizable(false)
+            .show(ctx, |ui| {
+                let palette = self.palette();
+                egui::Frame::new()
+                    .fill(palette.panel.linear_multiply(0.62))
+                    .stroke(Stroke::new(0.0, Color32::TRANSPARENT))
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
+                        ui.horizontal(|ui| {
+                            egui::ScrollArea::horizontal()
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        for index in 0..self.tabs.len() {
+                                            let selected = index == self.active_tab;
+                                            let status_color = self.tabs[index].status_color(&palette);
+                                            let title = self.tabs[index].title.clone();
+                                            let tab_fill = if selected {
+                                                palette.panel_alt.linear_multiply(1.14)
+                                            } else {
+                                                palette.panel.linear_multiply(0.92)
+                                            };
+                                            let tab_stroke = if selected {
+                                                palette.success.linear_multiply(0.92)
+                                            } else {
+                                                palette.stroke.linear_multiply(0.4)
+                                            };
+                                            let title_color = if selected {
+                                                palette.success
+                                            } else {
+                                                palette.text_secondary
+                                            };
+
+                                            egui::Frame::new()
+                                                .fill(tab_fill)
+                                                .stroke(Stroke::new(
+                                                    if selected { 1.25 } else { 0.9 },
+                                                    tab_stroke,
+                                                ))
+                                                .corner_radius(CornerRadius::same(14))
+                                                .inner_margin(Margin::symmetric(12, 8))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(
+                                                            RichText::new("●")
+                                                                .small()
+                                                                .color(status_color),
+                                                        );
+                                                        let response = ui.add(
+                                                            egui::Button::new(
+                                                                RichText::new(title)
+                                                                    .small()
+                                                                    .strong()
+                                                                    .color(title_color),
+                                                            )
+                                                            .frame(false),
+                                                        );
+                                                        if response.clicked() {
+                                                            self.active_tab = index;
+                                                            self.tabs[index].unseen_output = false;
+                                                        }
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    RichText::new("×")
+                                                                        .small()
+                                                                        .color(if selected {
+                                                                            palette.text_primary
+                                                                        } else {
+                                                                            palette.text_muted
+                                                                        }),
+                                                                )
+                                                                .frame(false),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            *pending_close = Some(index);
+                                                        }
+                                                    });
+                                                });
+                                        }
+                                    });
+                                });
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("+")
+                                                    .strong()
+                                                    .color(palette.text_secondary),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.app_page = AppPage::Connections;
+                                    }
+                                },
+                            );
+                        });
+                    });
+            });
+    }
+
     fn draw_modal_backdrop(&self, ctx: &egui::Context) {
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -2752,7 +3309,7 @@ impl App {
         painter.rect_filled(
             ctx.content_rect(),
             0.0,
-            Color32::from_rgba_premultiplied(4, 6, 10, 168),
+            Color32::from_rgba_premultiplied(8, 12, 18, 92),
         );
     }
 
@@ -2805,6 +3362,7 @@ impl App {
             return;
         }
 
+        let palette = self.palette();
         let mut open = self.show_server_editor_dialog;
         let title = if self.editing_server_key.is_some() {
             "编辑连接"
@@ -2815,7 +3373,9 @@ impl App {
         egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
-            .resizable(true)
+            .resizable(false)
+            .default_width(520.0)
+            .frame(glass_window_frame(&palette))
             .show(ctx, |ui| {
                 ui.set_min_width(460.0);
                 egui::Grid::new("server_form_grid_modal_minimal")
@@ -2829,7 +3389,7 @@ impl App {
                         ui.label("主机");
                         ui.add(
                             TextEdit::singleline(&mut self.server_form.host)
-                                .hint_text("host or root@host"),
+                                .hint_text("例如：192.168.1.12 或 root@192.168.1.12"),
                         );
                         ui.end_row();
 
@@ -2906,6 +3466,7 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(glass_window_frame(&palette))
             .show(ctx, |ui| {
                 ui.set_width(460.0);
 
@@ -2929,10 +3490,10 @@ impl App {
                 }
 
                 ui.horizontal(|ui| {
-                    if ui.button("Submit").clicked() {
+                    if ui.button("提交").clicked() {
                         submit = true;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("取消").clicked() {
                         cancel = true;
                     }
                 });
@@ -2949,10 +3510,10 @@ impl App {
                 match self.tabs[index].session.submit_auth_prompt(responses) {
                     Ok(()) => {
                         self.tabs[index]
-                            .push_system_message("Authentication response submitted.");
+                            .push_system_message("已提交认证信息。");
                     }
                     Err(error) => {
-                        let message = format!("Failed to submit authentication response: {error}");
+                        let message = format!("提交认证信息失败: {error}");
                         self.tabs[index].push_system_message(&message);
                         self.set_flash(message, true);
                         self.auth_prompt_dialog = Some(dialog);
@@ -2962,7 +3523,7 @@ impl App {
         } else if cancel {
             if let Some(index) = self.tabs.iter().position(|tab| tab.id == dialog.tab_id) {
                 let _ = self.tabs[index].session.disconnect();
-                self.tabs[index].push_system_message("Authentication was cancelled from the UI.");
+                self.tabs[index].push_system_message("已从界面取消认证。");
             }
         } else {
             self.auth_prompt_dialog = Some(dialog);
@@ -2974,11 +3535,13 @@ impl App {
             return;
         };
 
+        let palette = self.palette();
         let mut keep_open = true;
         egui::Window::new("删除连接")
             .open(&mut keep_open)
             .collapsible(false)
             .resizable(false)
+            .frame(glass_window_frame(&palette))
             .show(ctx, |ui| {
                 ui.label(format!("确认删除 `{}` 吗？", server.name));
                 ui.label(server.endpoint());
@@ -3006,6 +3569,7 @@ impl App {
         pending_run_command: &mut Option<String>,
         palette: &ThemePalette,
     ) {
+        let _ = pending_run_command;
         if self.is_first_run() {
             self.draw_first_run_welcome(ui, ctx, palette);
             return;
@@ -3014,8 +3578,10 @@ impl App {
         match self.home_page {
             HomePage::Hosts => self.draw_hosts_gallery(ui, pending_connect, palette),
             HomePage::Sync => self.draw_sync_summary_card(ui, palette),
-            HomePage::Scripts => self.draw_script_center_card(ui, pending_run_command, palette),
-            HomePage::History => self.draw_history_card(ui, pending_connect, palette),
+            HomePage::Scripts | HomePage::History => {
+                self.home_page = HomePage::Hosts;
+                self.draw_hosts_gallery(ui, pending_connect, palette);
+            }
             HomePage::Audit => {
                 self.draw_audit_card(ui, palette);
                 ui.add_space(10.0);
@@ -3041,7 +3607,7 @@ impl App {
                         badge(
                             ui,
                             palette,
-                            "FIRST RUN",
+                            "首次使用",
                             palette.accent_soft,
                             palette.text_primary,
                         );
@@ -3104,21 +3670,21 @@ impl App {
                         rich_info_card(
                             &mut columns[0],
                             palette,
-                            "TERMINAL",
+                            "终端",
                             "会话终端",
                             "保留 SSH 会话状态、重连控制和命令输入区。",
                         );
                         rich_info_card(
                             &mut columns[1],
                             palette,
-                            "FILES",
+                            "文件",
                             "文件传输",
                             "连接后就能浏览远端目录，上传、下载和新建目录。",
                         );
                         rich_info_card(
                             &mut columns[2],
                             palette,
-                            "SCRIPTS",
+                            "脚本",
                             "脚本与历史",
                             "常用命令、收藏脚本和访问记录都会沉淀下来。",
                         );
@@ -3169,7 +3735,7 @@ impl App {
                         );
                         ui.add_space(8.0);
                         ui.label(
-                            RichText::new("Host: 192.168.1.10\nPort: 22\nUser: ubuntu")
+                            RichText::new("主机: 192.168.1.10\n端口: 22\n用户: ubuntu")
                                 .monospace()
                                 .color(palette.text_secondary),
                         );
@@ -3178,14 +3744,14 @@ impl App {
                             badge(
                                 ui,
                                 palette,
-                                "Password / Key",
+                                "密码 / 密钥",
                                 palette.panel_soft,
                                 palette.text_secondary,
                             );
                             badge(
                                 ui,
                                 palette,
-                                "Auto reconnect",
+                                "自动重连",
                                 palette.panel_soft,
                                 palette.text_secondary,
                             );
@@ -3211,12 +3777,16 @@ impl App {
             });
     }
 
+    #[allow(unreachable_code)]
     fn draw_hosts_gallery(
         &mut self,
         ui: &mut egui::Ui,
         pending_connect: &mut Option<Server>,
         palette: &ThemePalette,
     ) {
+        self.draw_hosts_gallery_modern(ui, pending_connect, palette);
+        return;
+
         let mut grouped: BTreeMap<String, Vec<Server>> = BTreeMap::new();
         for server in self
             .servers
@@ -3293,10 +3863,16 @@ impl App {
                     let tint = host_card_tint(palette, index);
 
                     egui::Frame::new()
-                        .fill(palette.panel_soft)
-                        .stroke(Stroke::new(1.0, palette.stroke))
-                        .corner_radius(CornerRadius::same(22))
+                        .fill(palette.panel_soft.linear_multiply(1.06))
+                        .stroke(Stroke::new(1.0, tint.linear_multiply(0.42)))
+                        .corner_radius(CornerRadius::same(24))
                         .inner_margin(Margin::same(14))
+                        .shadow(Shadow {
+                            offset: [0, 16],
+                            blur: 34,
+                            spread: 0,
+                            color: palette.shadow,
+                        })
                         .show(ui, |ui| {
                             ui.set_width(240.0);
                             ui.horizontal_wrapped(|ui| {
@@ -3365,10 +3941,16 @@ impl App {
                                     egui::Layout::top_down(egui::Align::Min),
                                     |ui| {
                                         egui::Frame::new()
-                                            .fill(palette.panel_soft)
-                                            .stroke(Stroke::new(1.0, palette.stroke))
-                                            .corner_radius(CornerRadius::same(22))
+                                            .fill(palette.panel_soft.linear_multiply(1.08))
+                                            .stroke(Stroke::new(1.0, tint.linear_multiply(0.36)))
+                                            .corner_radius(CornerRadius::same(24))
                                             .inner_margin(Margin::same(14))
+                                            .shadow(Shadow {
+                                                offset: [0, 16],
+                                                blur: 36,
+                                                spread: 0,
+                                                color: palette.shadow,
+                                            })
                                             .show(ui, |ui| {
                                                 ui.set_min_width(258.0);
                                                 ui.horizontal_wrapped(|ui| {
@@ -3411,11 +3993,11 @@ impl App {
                                                                     palette.text_primary,
                                                                 );
                                                                 ui.label(
-                                                                    RichText::new("new click opens another tab")
+                                                                    RichText::new("再次点击会新开一个标签")
                                                                         .small()
                                                                         .color(palette.text_muted),
                                                                 );
-                                                                if ui.small_button("focus latest").clicked() {
+                                                                if ui.small_button("切到最新").clicked() {
                                                                     pending_focus_server_key =
                                                                         Some(server.server_key());
                                                                 }
@@ -3471,6 +4053,244 @@ impl App {
                                 );
                                 ui.add_space(8.0);
                             }
+                        }
+                    });
+                });
+        });
+
+        if let Some(server) = pending_edit {
+            self.start_editing_server(&server);
+        }
+        if let Some(server) = pending_delete {
+            self.request_server_delete(server);
+        }
+        if let Some(server_key) = pending_focus_server_key {
+            let _ = self.focus_existing_session_tab(&server_key);
+        }
+    }
+
+    fn draw_hosts_gallery_modern(
+        &mut self,
+        ui: &mut egui::Ui,
+        pending_connect: &mut Option<Server>,
+        palette: &ThemePalette,
+    ) {
+        let servers: Vec<Server> = self
+            .servers
+            .iter()
+            .filter(|server| server.matches_query(&self.search_query))
+            .cloned()
+            .collect();
+        let mut grouped: BTreeMap<String, Vec<Server>> = BTreeMap::new();
+        for server in &servers {
+            grouped
+                .entry(server.group_name().to_string())
+                .or_default()
+                .push(server.clone());
+        }
+        let active_count = servers
+            .iter()
+            .filter(|server| {
+                self.tabs
+                    .iter()
+                    .any(|tab| tab.server.server_key() == server.server_key())
+            })
+            .count();
+        let mut pending_edit: Option<Server> = None;
+        let mut pending_delete: Option<Server> = None;
+        let mut pending_focus_server_key: Option<String> = None;
+
+        card_frame(palette, palette.panel, 18).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("主机列表")
+                            .font(self.display_font(30.0))
+                            .color(palette.text_primary),
+                    );
+                    ui.label(
+                        RichText::new("更紧凑的深色运维面板风格，点击卡片直接打开新会话。")
+                            .small()
+                            .color(palette.text_secondary),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("新建连接").clicked() {
+                        self.open_new_server_dialog();
+                    }
+                });
+            });
+
+            ui.add_space(14.0);
+            ui.add(
+                TextEdit::singleline(&mut self.search_query)
+                    .hint_text("搜索主机、用户、分组")
+                    .desired_width(360.0),
+            );
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                stat_chip(ui, palette, "主机数量", servers.len().to_string());
+                stat_chip(ui, palette, "已打开", active_count.to_string());
+                stat_chip(ui, palette, "分组", grouped.len().to_string());
+            });
+
+            ui.add_space(16.0);
+            if grouped.is_empty() {
+                card_frame(palette, palette.panel_soft, 16).show(ui, |ui| {
+                    ui.label(
+                        RichText::new("当前没有匹配的主机。可以先新建连接，或者换一个搜索关键词。")
+                            .color(palette.text_secondary),
+                    );
+                });
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, server) in servers.iter().enumerate() {
+                            let tint = host_card_tint(palette, index);
+                            let already_open = self
+                                .tabs
+                                .iter()
+                                .any(|tab| tab.server.server_key() == server.server_key());
+
+                            ui.allocate_ui_with_layout(
+                                vec2(314.0, 138.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    let card = egui::Frame::new()
+                                        .fill(palette.panel_alt.linear_multiply(1.02))
+                                        .stroke(Stroke::new(
+                                            if already_open { 1.2 } else { 1.0 },
+                                            if already_open {
+                                                tint.linear_multiply(0.58)
+                                            } else {
+                                                palette.stroke.linear_multiply(0.58)
+                                            },
+                                        ))
+                                        .corner_radius(CornerRadius::same(24))
+                                        .inner_margin(Margin::symmetric(14, 13))
+                                        .shadow(Shadow {
+                                            offset: [0, 16],
+                                            blur: 24,
+                                            spread: 0,
+                                            color: palette.shadow,
+                                        })
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(286.0);
+                                            ui.horizontal(|ui| {
+                                                egui::Frame::new()
+                                                    .fill(tint.linear_multiply(0.24))
+                                                    .stroke(Stroke::new(1.0, tint.linear_multiply(0.52)))
+                                                    .corner_radius(CornerRadius::same(14))
+                                                    .inner_margin(Margin::symmetric(10, 9))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            RichText::new(host_card_pill_label(server))
+                                                                .small()
+                                                                .strong()
+                                                                .color(tint),
+                                                        );
+                                                    });
+
+                                                ui.add_space(8.0);
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        RichText::new(&server.name)
+                                                            .strong()
+                                                            .color(palette.text_primary),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{}  ·  {}",
+                                                            host_card_meta(server),
+                                                            server.group_name()
+                                                        ))
+                                                        .small()
+                                                        .color(palette.text_muted),
+                                                    );
+                                                });
+
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        if already_open {
+                                                            badge(
+                                                                ui,
+                                                                palette,
+                                                                "已打开",
+                                                                tint.linear_multiply(0.18),
+                                                                tint,
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                            });
+
+                                            ui.add_space(10.0);
+                                            ui.label(
+                                                RichText::new(server.endpoint())
+                                                    .small()
+                                                    .color(palette.text_secondary),
+                                            );
+                                            ui.add_space(8.0);
+                                            ui.horizontal_wrapped(|ui| {
+                                                badge(
+                                                    ui,
+                                                    palette,
+                                                    server.group_name(),
+                                                    palette.panel_soft,
+                                                    palette.text_secondary,
+                                                );
+                                                badge(
+                                                    ui,
+                                                    palette,
+                                                    server.auth_method.label(),
+                                                    palette.panel_soft,
+                                                    palette.text_secondary,
+                                                );
+                                                badge(
+                                                    ui,
+                                                    palette,
+                                                    if server.connection_policy.auto_reconnect {
+                                                        "自动重连"
+                                                    } else {
+                                                        "单次连接"
+                                                    },
+                                                    palette.panel_soft,
+                                                    palette.text_muted,
+                                                );
+                                            });
+                                            ui.add_space(10.0);
+                                            ui.horizontal_wrapped(|ui| {
+                                                if ui
+                                                    .button(if already_open { "新建会话" } else { "连接" })
+                                                    .clicked()
+                                                {
+                                                    *pending_connect = Some(server.clone());
+                                                }
+                                                if already_open && ui.small_button("定位标签").clicked() {
+                                                    pending_focus_server_key =
+                                                        Some(server.server_key());
+                                                }
+                                                if ui.small_button("编辑").clicked() {
+                                                    pending_edit = Some(server.clone());
+                                                }
+                                                if ui.small_button("删除").clicked() {
+                                                    pending_delete = Some(server.clone());
+                                                }
+                                            });
+                                        });
+
+                                    let response = card.response.interact(egui::Sense::click());
+                                    if response.clicked() {
+                                        *pending_connect = Some(server.clone());
+                                    }
+                                },
+                            );
+                            ui.add_space(10.0);
                         }
                     });
                 });
@@ -3553,20 +4373,327 @@ impl App {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
 
-            if self.tabs.is_empty() {
-                self.draw_home_landing(ui, ctx, pending_connect, pending_run_command, &palette);
-                return;
+            match self.app_page {
+                AppPage::Terminal => {
+                    if self.tabs.is_empty() {
+                        card_frame(&palette, palette.panel, 20).show(ui, |ui| {
+                            ui.label(
+                                RichText::new("先建立一个 SSH 连接，再开始终端会话")
+                                    .font(self.display_font(28.0))
+                                    .color(palette.text_primary),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(
+                                    "莓莓SSH终端的定位是 PuTTY、Termius、SecureCRT 和 macOS Terminal.app 的替代方案。先到连接页面新建或打开主机，再开始你的 SSH 会话。",
+                                )
+                                .color(palette.text_secondary),
+                            );
+                            ui.add_space(12.0);
+                            if ui.button("前往 SSH 连接").clicked() {
+                                self.app_page = AppPage::Connections;
+                            }
+                        });
+                    } else {
+                        self.draw_terminal_workbench(
+                            ui,
+                            ctx,
+                            pending_connect,
+                            pending_run_command,
+                            pending_send_command,
+                            pending_restart_active_tab,
+                            pending_pin_shortcut,
+                            &palette,
+                        );
+                    }
+                }
+                AppPage::Connections => {
+                    self.home_page = HomePage::Hosts;
+                    self.draw_home_landing(ui, ctx, pending_connect, pending_run_command, &palette);
+                }
+                AppPage::Settings => {
+                    self.draw_settings_page(ui, ctx, &palette);
+                }
+                AppPage::Config => {
+                    self.draw_config_page(ui, ctx, &palette);
+                }
             }
+        });
+    }
 
-            self.draw_terminal_shell(
+    fn draw_terminal_workbench(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pending_connect: &mut Option<Server>,
+        pending_run_command: &mut Option<String>,
+        pending_send_command: &mut Option<String>,
+        pending_restart_active_tab: &mut bool,
+        pending_pin_shortcut: &mut Option<String>,
+        palette: &ThemePalette,
+    ) {
+        let current = self.terminal_workbench_tab;
+        card_frame(palette, palette.panel, 14).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(current.label())
+                            .font(self.display_font(26.0))
+                            .color(palette.text_primary),
+                    );
+                    ui.label(
+                        RichText::new(current.subtitle())
+                            .small()
+                            .color(palette.text_secondary),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for tab in [
+                        TerminalWorkbenchTab::Theme,
+                        TerminalWorkbenchTab::Sftp,
+                        TerminalWorkbenchTab::Vault,
+                        TerminalWorkbenchTab::SplitTerminal,
+                    ] {
+                        if shell_pill(
+                            ui,
+                            palette,
+                            tab.label(),
+                            self.terminal_workbench_tab == tab,
+                            12,
+                            8,
+                        )
+                        .clicked()
+                        {
+                            self.terminal_workbench_tab = tab;
+                        }
+                    }
+                });
+            });
+        });
+
+        ui.add_space(10.0);
+        match self.terminal_workbench_tab {
+            TerminalWorkbenchTab::SplitTerminal => self.draw_terminal_split_workspace(
+                ui,
+                ctx,
+                pending_run_command,
+                pending_send_command,
+                pending_restart_active_tab,
+                pending_pin_shortcut,
+                palette,
+            ),
+            TerminalWorkbenchTab::Vault => {
+                self.draw_terminal_vault_view(ui, ctx, pending_connect, pending_run_command, palette);
+            }
+            TerminalWorkbenchTab::Sftp => {
+                self.draw_terminal_sftp_view(ui, ctx, palette);
+            }
+            TerminalWorkbenchTab::Theme => {
+                self.draw_terminal_theme_view(ui, ctx, palette);
+            }
+        }
+    }
+
+    fn draw_terminal_split_workspace(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pending_run_command: &mut Option<String>,
+        pending_send_command: &mut Option<String>,
+        pending_restart_active_tab: &mut bool,
+        pending_pin_shortcut: &mut Option<String>,
+        palette: &ThemePalette,
+    ) {
+        let width = ui.available_width();
+        if width < 1160.0 {
+            self.draw_terminal_shell_modern(
                 ui,
                 ctx,
                 pending_send_command,
                 pending_restart_active_tab,
                 pending_pin_shortcut,
-                &palette,
+                palette,
+            );
+            ui.add_space(10.0);
+            self.draw_quick_actions_card(ui, pending_run_command, palette);
+            return;
+        }
+
+        StripBuilder::new(ui)
+            .size(Size::remainder().at_least(720.0))
+            .size(Size::exact(340.0))
+            .horizontal(|mut strip| {
+                strip.cell(|ui| {
+                    self.draw_terminal_shell_modern(
+                        ui,
+                        ctx,
+                        pending_send_command,
+                        pending_restart_active_tab,
+                        pending_pin_shortcut,
+                        palette,
+                    );
+                });
+                strip.cell(|ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.draw_connection_overview_card(ui, palette);
+                            ui.add_space(10.0);
+                            self.draw_quick_actions_card(ui, pending_run_command, palette);
+                            ui.add_space(10.0);
+                            self.draw_audit_card(ui, palette);
+                        });
+                });
+            });
+    }
+
+    fn draw_terminal_vault_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pending_connect: &mut Option<Server>,
+        pending_run_command: &mut Option<String>,
+        palette: &ThemePalette,
+    ) {
+        let width = ui.available_width();
+        if width < 1120.0 {
+            self.draw_quick_actions_card(ui, pending_run_command, palette);
+            ui.add_space(10.0);
+            self.draw_history_card(ui, pending_connect, palette);
+            ui.add_space(10.0);
+            self.draw_audit_card(ui, palette);
+            ui.add_space(10.0);
+            self.draw_workspace_card(ui, ctx, palette);
+            return;
+        }
+
+        ui.columns(2, |columns| {
+            columns[0].spacing_mut().item_spacing = vec2(10.0, 10.0);
+            columns[1].spacing_mut().item_spacing = vec2(10.0, 10.0);
+
+            self.draw_quick_actions_card(&mut columns[0], pending_run_command, palette);
+            self.draw_history_card(&mut columns[0], pending_connect, palette);
+
+            self.draw_audit_card(&mut columns[1], palette);
+            columns[1].add_space(10.0);
+            self.draw_workspace_card(&mut columns[1], ctx, palette);
+        });
+    }
+
+    fn draw_terminal_sftp_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        palette: &ThemePalette,
+    ) {
+        card_frame(palette, palette.panel_soft, 14).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("SFTP 文件传输")
+                        .font(self.display_font(24.0))
+                        .color(palette.text_primary),
+                );
+                ui.label(
+                    RichText::new("像专业 SSH 客户端一样处理远程目录、上传下载、建目录与清理。")
+                        .small()
+                        .color(palette.text_secondary),
+                );
+            });
+        });
+
+        ui.add_space(10.0);
+        self.draw_file_transfer_card(ui, palette);
+        ui.add_space(10.0);
+        self.draw_workspace_card(ui, ctx, palette);
+    }
+
+    fn draw_terminal_theme_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        palette: &ThemePalette,
+    ) {
+        card_frame(palette, palette.panel_soft, 14).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("SSH 客户端主题")
+                        .font(self.display_font(24.0))
+                        .color(palette.text_primary),
+                );
+                ui.label(
+                    RichText::new("统一控制终端、导航、卡片与背景，让整套 SSH 体验风格一致。")
+                        .small()
+                        .color(palette.text_secondary),
+                );
+            });
+        });
+
+        ui.add_space(10.0);
+        self.draw_settings_page(ui, ctx, palette);
+    }
+
+    fn draw_settings_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &ThemePalette) {
+        card_frame(palette, palette.panel, 18).show(ui, |ui| {
+            ui.label(
+                RichText::new("外观设置")
+                    .font(self.display_font(28.0))
+                    .color(palette.text_primary),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("主题、终端外观以及全局视觉偏好都放在这里。")
+                    .color(palette.text_secondary),
             );
         });
+
+        ui.add_space(10.0);
+        card_frame(palette, palette.panel_soft, 18).show(ui, |ui| {
+            ui.label(RichText::new("主题预设").strong().color(palette.text_primary));
+            ui.add_space(8.0);
+            let mut selected_theme = self.settings.theme_preset;
+            ui.horizontal_wrapped(|ui| {
+                for preset in [
+                    ThemePreset::PeachBlossom,
+                    ThemePreset::Celadon,
+                    ThemePreset::Vermilion,
+                ] {
+                    if shell_pill(ui, palette, preset.label(), selected_theme == preset, 12, 8)
+                        .clicked()
+                    {
+                        selected_theme = preset;
+                    }
+                }
+            });
+            if selected_theme != self.settings.theme_preset {
+                self.update_theme(ctx, selected_theme);
+            }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(self.settings.theme_preset.subtitle())
+                    .small()
+                    .color(palette.text_muted),
+            );
+        });
+    }
+
+    fn draw_config_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &ThemePalette) {
+        card_frame(palette, palette.panel, 18).show(ui, |ui| {
+            ui.label(
+                RichText::new("系统配置")
+                    .font(self.display_font(28.0))
+                    .color(palette.text_primary),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("同步、工作区和应用级配置已经拆分到这里。")
+                    .color(palette.text_secondary),
+            );
+        });
+
+        ui.add_space(10.0);
+        self.draw_sync_summary_card(ui, palette);
+        ui.add_space(10.0);
+        self.draw_workspace_card(ui, ctx, palette);
     }
 
     fn draw_history_card(
@@ -4331,6 +5458,7 @@ impl App {
                 .unwrap_or_default();
 
             let title_font = self.display_font(28.0);
+            let mut pending_interrupt_echo = false;
             let tab = &mut self.tabs[active_index];
             tab.unseen_output = false;
 
@@ -4437,7 +5565,7 @@ impl App {
                     }
                     if ui.button("发送 Ctrl+C").clicked() {
                         match tab.session.interrupt() {
-                            Ok(()) => tab.push_system_message("已向远端 Shell 发送 Ctrl+C。"),
+                            Ok(()) => pending_interrupt_echo = true,
                             Err(error) => {
                                 tab.push_system_message(&format!("发送 Ctrl+C 失败：{error}"))
                             }
@@ -4484,6 +5612,9 @@ impl App {
                     }
                 });
             });
+            if pending_interrupt_echo {
+                self.echo_terminal_interrupt(active_index);
+            }
         });
     }
 
@@ -4491,15 +5622,15 @@ impl App {
         card_frame(palette, palette.panel, 18).show(ui, |ui| {
             ui.add_space(12.0);
             ui.label(
-                RichText::new("更轻盈的 SSH 工作台")
+                RichText::new("现代 SSH 客户端")
                     .font(self.display_font(40.0))
                     .color(palette.text_primary),
             );
             ui.add_space(6.0);
             ui.label(
                 RichText::new(
-                    "从左侧打开一台已保存的服务器，或者登录同步账号，把你的工作台一并拉下来。\
-                     这次版本已经补齐了分组历史、服务器编辑、主题配色和可同步的快捷命令。",
+                    "用于建立 SSH 连接，替代 PuTTY、Termius、SecureCRT 和 macOS Terminal.app。\
+                     从左侧打开一台已保存的服务器，或者先新建连接，再进入终端、SFTP 和连接资料视图。",
                 )
                 .color(palette.text_secondary),
             );
@@ -4573,9 +5704,15 @@ impl App {
                 texture.id(),
                 rect,
                 egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::from_rgba_premultiplied(255, 255, 255, 148),
+                Color32::from_rgba_premultiplied(255, 255, 255, 178),
             );
         }
+
+        painter.rect_filled(
+            rect,
+            0.0,
+            Color32::from_rgba_premultiplied(5, 10, 18, 34),
+        );
 
         let mut overlay = Mesh::default();
         let base = overlay.vertices.len() as u32;
@@ -4585,7 +5722,7 @@ impl App {
                 palette.background_top.r(),
                 palette.background_top.g(),
                 palette.background_top.b(),
-                112,
+                126,
             ),
         );
         overlay.colored_vertex(
@@ -4594,7 +5731,7 @@ impl App {
                 palette.background_top.r(),
                 palette.background_top.g(),
                 palette.background_top.b(),
-                72,
+                84,
             ),
         );
         overlay.colored_vertex(
@@ -4603,7 +5740,7 @@ impl App {
                 palette.background_bottom.r(),
                 palette.background_bottom.g(),
                 palette.background_bottom.b(),
-                104,
+                118,
             ),
         );
         overlay.colored_vertex(
@@ -4612,7 +5749,7 @@ impl App {
                 palette.background_bottom.r(),
                 palette.background_bottom.g(),
                 palette.background_bottom.b(),
-                126,
+                138,
             ),
         );
         overlay.add_triangle(base, base + 1, base + 2);
@@ -4621,27 +5758,35 @@ impl App {
 
         painter.circle_filled(
             pos2(
-                rect.left() + rect.width() * 0.78,
-                rect.top() + rect.height() * 0.18,
+                rect.left() + rect.width() * 0.82,
+                rect.top() + rect.height() * 0.15,
             ),
-            rect.width().min(rect.height()) * 0.2,
-            palette.blossom.linear_multiply(0.95),
+            rect.width().min(rect.height()) * 0.24,
+            palette.blossom.linear_multiply(1.12),
         );
         painter.circle_filled(
             pos2(
-                rect.left() + rect.width() * 0.18,
-                rect.top() + rect.height() * 0.22,
+                rect.left() + rect.width() * 0.16,
+                rect.top() + rect.height() * 0.2,
             ),
-            rect.width().min(rect.height()) * 0.14,
-            palette.mist.linear_multiply(1.2),
+            rect.width().min(rect.height()) * 0.16,
+            palette.mist.linear_multiply(1.45),
         );
         painter.circle_filled(
             pos2(
-                rect.left() + rect.width() * 0.48,
-                rect.top() + rect.height() * 0.78,
+                rect.left() + rect.width() * 0.52,
+                rect.top() + rect.height() * 0.82,
             ),
-            rect.width().min(rect.height()) * 0.18,
-            palette.blossom.linear_multiply(0.58),
+            rect.width().min(rect.height()) * 0.22,
+            palette.blossom.linear_multiply(0.72),
+        );
+        painter.circle_filled(
+            pos2(
+                rect.left() + rect.width() * 0.3,
+                rect.top() + rect.height() * 0.62,
+            ),
+            rect.width().min(rect.height()) * 0.11,
+            palette.accent_soft.linear_multiply(1.25),
         );
 
         painter.line_segment(
@@ -4680,6 +5825,10 @@ impl eframe::App for App {
         {
             self.flash_message = None;
         }
+        if self.background_texture.is_none() {
+            self.background_texture = load_background_texture(ctx);
+        }
+        apply_theme(ctx, self.settings.theme_preset);
         self.paint_background(ctx);
         let repaint_ms = if self.file_transfer.is_busy()
             || self
@@ -4703,8 +5852,12 @@ impl eframe::App for App {
         let mut pending_pin_shortcut = None;
 
         self.draw_shell_top_bar(ctx);
-        self.draw_shell_sidebar(ctx, &mut pending_connect);
-        self.draw_global_tabs_bar(ctx, &mut pending_close);
+        if self.app_page == AppPage::Connections {
+            self.draw_shell_sidebar(ctx, &mut pending_connect);
+        }
+        if self.app_page == AppPage::Terminal {
+            self.draw_global_tabs_bar_modern(ctx, &mut pending_close);
+        }
         self.draw_workspace(
             ctx,
             &mut pending_connect,
@@ -4713,7 +5866,7 @@ impl eframe::App for App {
             &mut pending_restart_active_tab,
             &mut pending_pin_shortcut,
         );
-        if self.has_modal_open() {
+        if self.has_blocking_modal_open() {
             self.draw_modal_backdrop(ctx);
         }
         self.draw_sync_dialog_modal(ctx);
@@ -4980,7 +6133,7 @@ fn build_terminal_layout_job(
     identity: &str,
     show_cursor: bool,
 ) -> LayoutJob {
-    let font_id = FontId::new(13.5, FontFamily::Name(TERMINAL_FONT_NAME.into()));
+    let font_id = FontId::new(13.0, FontFamily::Name(TERMINAL_FONT_NAME.into()));
     let mut job = LayoutJob::default();
     let body_color = palette.terminal_text;
 
@@ -4998,8 +6151,8 @@ fn build_terminal_layout_job(
             0.0,
             TextFormat {
                 font_id: font_id.clone(),
-                color: palette.accent,
-                line_height: Some(14.5),
+                color: palette.success,
+                line_height: Some(13.4),
                 ..Default::default()
             },
         );
@@ -5088,16 +6241,25 @@ fn classify_terminal_token(
         || full_line.trim_start().contains("@");
 
     if trimmed == identity || lower.starts_with("root@") || lower.contains("@localhost") {
-        return palette.accent;
+        return palette.success;
     }
     if prompt_like && matches!(trimmed, "$" | "#" | ">" | "%") {
         return palette.warning;
     }
+    if trimmed.ends_with(':') && trimmed.len() > 1 {
+        return palette.accent;
+    }
     if trimmed.starts_with("~/") || trimmed.starts_with('/') || trimmed.starts_with("./") {
-        return palette.text_secondary;
+        return palette.accent;
     }
     if trimmed.starts_with("--") || (trimmed.starts_with('-') && trimmed.len() > 1) {
         return palette.warning;
+    }
+    if lower.starts_with("0x") || lower.chars().all(|ch| ch.is_ascii_digit()) {
+        return palette.warning;
+    }
+    if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+        return palette.text_secondary;
     }
     if matches!(
         lower.as_str(),
@@ -5139,10 +6301,7 @@ fn classify_terminal_token(
             | "echo"
             | "export"
     ) {
-        return palette.accent;
-    }
-    if lower.chars().all(|ch| ch.is_ascii_digit()) {
-        return palette.text_muted;
+        return palette.success;
     }
 
     line_color
@@ -5159,7 +6318,7 @@ fn append_terminal_span(job: &mut LayoutJob, text: &str, font_id: &FontId, color
         TextFormat {
             font_id: font_id.clone(),
             color,
-            line_height: Some(14.5),
+            line_height: Some(13.4),
             ..Default::default()
         },
     );
@@ -5234,23 +6393,20 @@ fn control_key_byte(key: egui::Key) -> Option<u8> {
 }
 
 fn default_workspace_path() -> PathBuf {
-    dirs::config_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("rustssh_manager")
-        .join("workspace_snapshot.json")
+    data_dir().join("workspace_snapshot.json")
 }
 
 fn default_transfer_path() -> PathBuf {
-    dirs::download_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
+    temp_dir()
 }
 
 fn load_recent_audit_entries(limit: usize) -> Vec<String> {
     let data = match fs::read_to_string(audit_log_path()) {
         Ok(data) => data,
-        Err(_) => return Vec::new(),
+        Err(_) => match fs::read_to_string(legacy_audit_log_path()) {
+            Ok(data) => data,
+            Err(_) => return Vec::new(),
+        },
     };
 
     // Read from the end so the UI can show the latest audit activity without parsing the whole file.
@@ -5276,8 +6432,8 @@ fn apply_theme(ctx: &egui::Context, preset: ThemePreset) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = Color32::from_rgba_premultiplied(0, 0, 0, 0);
-    style.visuals.window_fill = palette.panel;
-    style.visuals.window_stroke = Stroke::new(1.0, palette.stroke);
+    style.visuals.window_fill = palette.panel.linear_multiply(1.08);
+    style.visuals.window_stroke = Stroke::new(0.9, palette.stroke.linear_multiply(0.72));
     style.visuals.window_shadow = Shadow {
         offset: [0, 18],
         blur: 48,
@@ -5292,18 +6448,19 @@ fn apply_theme(ctx: &egui::Context, preset: ThemePreset) {
     };
     style.visuals.window_corner_radius = CornerRadius::same(18);
     style.visuals.menu_corner_radius = CornerRadius::same(16);
-    style.visuals.extreme_bg_color = palette.panel_alt;
+    style.visuals.extreme_bg_color = palette.panel;
     style.visuals.faint_bg_color = palette.panel_soft;
-    style.visuals.code_bg_color = palette.panel_alt;
+    style.visuals.code_bg_color = palette.panel_soft;
     style.visuals.override_text_color = Some(palette.text_primary);
     style.visuals.widgets.noninteractive.bg_fill = palette.panel;
     style.visuals.widgets.noninteractive.weak_bg_fill = palette.panel_soft;
     style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.stroke);
     style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text_primary);
     style.visuals.widgets.noninteractive.corner_radius = CornerRadius::same(16);
-    style.visuals.widgets.inactive.bg_fill = palette.panel_alt;
+    style.visuals.widgets.inactive.bg_fill = palette.panel_soft;
     style.visuals.widgets.inactive.weak_bg_fill = palette.panel_soft;
-    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, palette.stroke);
+    style.visuals.widgets.inactive.bg_stroke =
+        Stroke::new(0.9, palette.stroke.linear_multiply(0.7));
     style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text_primary);
     style.visuals.widgets.inactive.corner_radius = CornerRadius::same(16);
     style.visuals.widgets.hovered.bg_fill = palette.panel_alt;
@@ -5313,7 +6470,7 @@ fn apply_theme(ctx: &egui::Context, preset: ThemePreset) {
     style.visuals.widgets.hovered.corner_radius = CornerRadius::same(16);
     style.visuals.widgets.active.bg_fill = palette.accent_soft;
     style.visuals.widgets.active.weak_bg_fill = palette.accent_soft;
-    style.visuals.widgets.active.bg_stroke = Stroke::new(1.4, palette.accent);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.2, palette.accent);
     style.visuals.widgets.active.fg_stroke = Stroke::new(1.2, palette.text_primary);
     style.visuals.widgets.active.corner_radius = CornerRadius::same(16);
     style.visuals.widgets.open.bg_fill = palette.panel_soft;
@@ -5368,32 +6525,51 @@ fn shell_pill(
 ) -> egui::Response {
     egui::Frame::new()
         .fill(if selected {
-            palette.accent_soft
+            palette.panel_alt.linear_multiply(1.2)
         } else {
-            palette.panel.linear_multiply(0.96)
+            palette.panel.linear_multiply(0.9)
         })
         .stroke(Stroke::new(
-            if selected { 1.35 } else { 1.15 },
+            if selected { 1.45 } else { 0.95 },
             if selected {
                 palette.accent
             } else {
-                palette.stroke
+                palette.stroke.linear_multiply(0.64)
             },
         ))
         .corner_radius(CornerRadius::same(99))
-        .inner_margin(Margin::symmetric(padding_x, padding_y))
+        .inner_margin(Margin::symmetric(padding_x + 1, padding_y + 1))
         .show(ui, |ui| {
             ui.add(
                 egui::Button::new(
                     RichText::new(label)
                         .small()
                         .strong()
-                        .color(palette.text_primary),
+                        .color(if selected {
+                            palette.text_primary
+                        } else {
+                            palette.text_secondary
+                        }),
                 )
                 .frame(false),
             )
         })
         .inner
+}
+
+fn terminal_toolbar_button(
+    ui: &mut egui::Ui,
+    palette: &ThemePalette,
+    label: &str,
+) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .small()
+                .color(palette.text_secondary),
+        )
+        .frame(false),
+    )
 }
 
 fn sidebar_nav_button(
@@ -5442,32 +6618,59 @@ fn host_card_tint(palette: &ThemePalette, index: usize) -> Color32 {
 
 fn host_card_symbol(server: &Server) -> &'static str {
     match server.auth_method {
+        AuthMethod::Password => "密码",
+        AuthMethod::PrivateKey => "密钥",
+    }
+}
+
+fn host_card_pill_label(server: &Server) -> &'static str {
+    match server.auth_method {
         AuthMethod::Password => "SSH",
         AuthMethod::PrivateKey => "KEY",
     }
 }
 
+fn host_card_meta(server: &Server) -> &'static str {
+    match server.auth_method {
+        AuthMethod::Password => "密码认证",
+        AuthMethod::PrivateKey => "SSH · 密钥",
+    }
+}
+
 fn card_frame(palette: &ThemePalette, fill: Color32, padding: i8) -> egui::Frame {
-    // Keep one shared "glass card" recipe so the panels feel consistent across the whole app.
     egui::Frame::new()
-        .fill(fill)
-        .stroke(Stroke::new(1.25, palette.stroke))
-        .corner_radius(CornerRadius::same(22))
+        .fill(fill.linear_multiply(1.06))
+        .stroke(Stroke::new(1.0, palette.stroke.linear_multiply(0.72)))
+        .corner_radius(CornerRadius::same(24))
         .inner_margin(Margin::same(padding))
         .shadow(Shadow {
-            offset: [0, 20],
-            blur: 44,
-            spread: 0,
+            offset: [0, 22],
+            blur: 56,
+            spread: 1,
+            color: palette.shadow,
+        })
+}
+
+fn glass_window_frame(palette: &ThemePalette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(palette.panel.linear_multiply(1.12))
+        .stroke(Stroke::new(1.0, palette.stroke.linear_multiply(0.78)))
+        .corner_radius(CornerRadius::same(26))
+        .inner_margin(Margin::same(20))
+        .shadow(Shadow {
+            offset: [0, 22],
+            blur: 64,
+            spread: 1,
             color: palette.shadow,
         })
 }
 
 fn stat_chip(ui: &mut egui::Ui, palette: &ThemePalette, label: &str, value: impl ToString) {
     egui::Frame::new()
-        .fill(palette.panel_alt.linear_multiply(0.96))
-        .stroke(Stroke::new(1.1, palette.stroke))
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(Margin::symmetric(10, 8))
+        .fill(palette.panel_alt.linear_multiply(1.04))
+        .stroke(Stroke::new(1.0, palette.stroke.linear_multiply(0.72)))
+        .corner_radius(CornerRadius::same(16))
+        .inner_margin(Margin::symmetric(11, 8))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -5493,10 +6696,10 @@ fn badge(
     text_color: Color32,
 ) {
     egui::Frame::new()
-        .fill(fill)
-        .stroke(Stroke::new(1.0, palette.stroke))
+        .fill(fill.linear_multiply(1.04))
+        .stroke(Stroke::new(1.0, palette.stroke.linear_multiply(0.72)))
         .corner_radius(CornerRadius::same(99))
-        .inner_margin(Margin::symmetric(10, 6))
+        .inner_margin(Margin::symmetric(11, 7))
         .show(ui, |ui| {
             ui.label(RichText::new(text).small().strong().color(text_color));
         });

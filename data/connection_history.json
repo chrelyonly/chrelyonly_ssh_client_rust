@@ -1,0 +1,20 @@
+[
+  {
+    "server_name": "192.168.10.69",
+    "server_group": "默认分组",
+    "server_key": "chrelyonly|192.168.10.69|22",
+    "host": "192.168.10.69",
+    "port": 22,
+    "user": "chrelyonly",
+    "timestamp": 1774705451
+  },
+  {
+    "server_name": "6666@127.0.0.1",
+    "server_group": "默认分组",
+    "server_key": "6666|127.0.0.1|22",
+    "host": "127.0.0.1",
+    "port": 22,
+    "user": "6666",
+    "timestamp": 1774605215
+  }
+]

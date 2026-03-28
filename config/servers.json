@@ -1,0 +1,20 @@
+[
+  {
+    "name": "192.168.10.69",
+    "host": "192.168.10.69",
+    "port": 22,
+    "user": "chrelyonly",
+    "group": "默认分组",
+    "auth_method": "password",
+    "private_key_path": null,
+    "password_in_keyring": true,
+    "connection_policy": {
+      "connect_timeout_secs": 10,
+      "keepalive_interval_secs": 15,
+      "keepalive_max_misses": 4,
+      "auto_reconnect": true,
+      "max_reconnect_attempts": 3,
+      "reconnect_backoff_secs": 5
+    }
+  }
+]

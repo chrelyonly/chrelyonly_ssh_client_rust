@@ -91,7 +91,7 @@ impl SessionHandle {
     pub fn submit_auth_prompt(&self, responses: Vec<String>) -> Result<()> {
         self.command_tx
             .send(SessionCommand::SubmitAuthPrompt { responses })
-            .map_err(|_| anyhow!("SSH session is unavailable"))
+            .map_err(|_| anyhow!("SSH 会话已不可用"))
     }
 
     pub fn reconnect_now(&self) -> Result<()> {
@@ -395,7 +395,7 @@ async fn run_connection_attempt(
                     Some(SessionCommand::SubmitAuthPrompt { .. }) => {
                         send_event(
                             event_tx,
-                            SessionEvent::Status("Authentication has already completed.".to_string()),
+                            SessionEvent::Status("认证已经完成。".to_string()),
                         );
                     }
                     Some(SessionCommand::ReconnectNow) => {
@@ -522,7 +522,7 @@ async fn authenticate_server(
     send_event(
         event_tx,
         SessionEvent::Status(format!(
-            "Authenticating as {} via {}...",
+            "正在以 {} 通过{}认证...",
             server.user,
             server.auth_method.label()
         )),
@@ -542,11 +542,11 @@ async fn authenticate_server(
                 let auth_result = session
                     .authenticate_password(server.user.clone(), password)
                     .await
-                    .context("failed to start password authentication")?;
+                    .context("发起密码认证失败")?;
 
                 if auth_result {
-                    send_event(event_tx, SessionEvent::Status("Authentication succeeded.".to_string()));
-                    append_server_event(server, "authentication_succeeded", "password");
+                    send_event(event_tx, SessionEvent::Status("认证成功。".to_string()));
+                    append_server_event(server, "认证成功", "密码认证");
                     return Ok(None);
                 }
             }
@@ -568,24 +568,24 @@ async fn authenticate_server(
                 .private_key_path
                 .as_deref()
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow!("A private key path is required for key authentication."))?;
+                .ok_or_else(|| anyhow!("私钥认证需要填写私钥路径。"))?;
 
             let private_key = load_secret_key(private_key_path, None)
-                .with_context(|| format!("Failed to load private key from {private_key_path}"))?;
+                .with_context(|| format!("加载私钥失败: {private_key_path}"))?;
 
             let auth_result = session
                 .authenticate_publickey(server.user.clone(), Arc::new(private_key))
                 .await
-                .context("failed to start public key authentication")?;
+                .context("发起私钥认证失败")?;
 
             if !auth_result {
-                bail!("Public key authentication failed for user {}", server.user);
+                bail!("用户 {} 的私钥认证失败", server.user);
             }
         }
     }
 
-    send_event(event_tx, SessionEvent::Status("Authentication succeeded.".to_string()));
-    append_server_event(server, "authentication_succeeded", server.auth_method.label());
+    send_event(event_tx, SessionEvent::Status("认证成功。".to_string()));
+    append_server_event(server, "认证成功", server.auth_method.label());
 
     Ok(None)
 }
@@ -605,13 +605,13 @@ async fn authenticate_keyboard_interactive(
     let mut response = session
         .authenticate_keyboard_interactive_start(server.user.clone(), None)
         .await
-        .context("failed to start keyboard-interactive authentication")?;
+        .context("发起键盘交互认证失败")?;
 
     loop {
         match response {
             KeyboardInteractiveAuthResponse::Success => return Ok(None),
             KeyboardInteractiveAuthResponse::Failure => {
-                bail!("Authentication failed for user {}", server.user);
+                bail!("用户 {} 的认证失败", server.user);
             }
             KeyboardInteractiveAuthResponse::InfoRequest {
                 name,
@@ -638,7 +638,7 @@ async fn authenticate_keyboard_interactive(
                         event_tx,
                         SessionEvent::AuthPrompt {
                             title: if name.trim().is_empty() {
-                                "Authentication Required".to_string()
+                                "需要认证".to_string()
                             } else {
                                 name
                             },
@@ -656,7 +656,7 @@ async fn authenticate_keyboard_interactive(
                 response = session
                     .authenticate_keyboard_interactive_respond(responses)
                     .await
-                    .context("failed to answer the interactive authentication prompts")?;
+                    .context("提交交互式认证响应失败")?;
             }
         }
     }
@@ -677,7 +677,7 @@ async fn wait_for_auth_prompt_response(
                 send_event(
                     event_tx,
                     SessionEvent::Status(format!(
-                        "Waiting for {expected_prompts} authentication field(s)."
+                        "等待填写 {expected_prompts} 个认证字段。"
                     )),
                 );
             }
@@ -686,24 +686,24 @@ async fn wait_for_auth_prompt_response(
                 send_event(
                     event_tx,
                     SessionEvent::Status(
-                        "Complete the authentication prompt before sending terminal input."
+                        "请先完成认证输入，再发送终端内容。"
                             .to_string(),
                     ),
                 );
             }
             Some(SessionCommand::ReconnectNow) => {
                 return AuthPromptResolution::Outcome(SessionOutcome::ReconnectNow(
-                    "Authentication restarted by the user.".to_string(),
+                    "用户重新发起了认证。".to_string(),
                 ));
             }
             Some(SessionCommand::Disconnect) => {
                 return AuthPromptResolution::Outcome(SessionOutcome::UserDisconnected(
-                    "Authentication cancelled by the user.".to_string(),
+                    "用户取消了认证。".to_string(),
                 ));
             }
             None => {
                 return AuthPromptResolution::Outcome(SessionOutcome::UiDetached(
-                    "Authentication prompt closed with the UI.".to_string(),
+                    "认证弹窗已随着界面关闭。".to_string(),
                 ));
             }
         }

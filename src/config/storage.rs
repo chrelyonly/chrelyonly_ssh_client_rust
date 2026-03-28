@@ -1,20 +1,19 @@
 use std::fs;
 use std::path::PathBuf;
 
-use dirs::{config_dir, home_dir};
-
 use crate::audit::log::append_server_event;
+use crate::config::paths::{config_dir, legacy_config_dir};
 use crate::config::server::{AuthMethod, Server};
 use crate::security::secrets::{clear_server_password, store_server_password};
 
-const APP_DIR_NAME: &str = "rustssh_manager";
 const SERVERS_FILE_NAME: &str = "servers.json";
 
 fn app_config_dir() -> PathBuf {
     config_dir()
-        .or_else(home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(APP_DIR_NAME)
+}
+
+fn legacy_servers_path() -> PathBuf {
+    legacy_config_dir().join(SERVERS_FILE_NAME)
 }
 
 pub fn config_path() -> PathBuf {
@@ -22,10 +21,14 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn load_servers() -> Vec<Server> {
-    let path = config_path();
-    let data = match fs::read_to_string(&path) {
-        Ok(data) => data,
-        Err(_) => return vec![],
+    let primary = config_path();
+    let legacy = legacy_servers_path();
+    let (path, data) = match fs::read_to_string(&primary) {
+        Ok(data) => (primary, data),
+        Err(_) => match fs::read_to_string(&legacy) {
+            Ok(data) => (legacy, data),
+            Err(_) => return vec![],
+        },
     };
 
     let mut servers = match serde_json::from_str::<Vec<Server>>(&data) {
@@ -50,7 +53,7 @@ pub fn load_servers() -> Vec<Server> {
                     append_server_event(server, "凭据迁移", "已将明文密码迁移到安全凭据存储。");
                 }
                 Err(error) => {
-                    eprintln!("为 {} 迁移凭据失败: {error:#}", server.endpoint());
+                    eprintln!("{} 迁移凭据失败: {error:#}", server.endpoint());
                 }
             }
         }
@@ -64,7 +67,7 @@ pub fn load_servers() -> Vec<Server> {
             .then_with(|| left.host.to_lowercase().cmp(&right.host.to_lowercase()))
     });
 
-    if migrated_plaintext_passwords {
+    if migrated_plaintext_passwords || path != config_path() {
         save_servers(&servers);
     }
 
@@ -91,14 +94,14 @@ pub fn save_servers(servers: &[Server]) {
                             );
                         }
                         Err(error) => {
-                            eprintln!("为 {} 写入安全凭据失败: {error:#}", normalized.endpoint());
+                            eprintln!("{} 写入安全凭据失败: {error:#}", normalized.endpoint());
                         }
                     }
                 }
             }
             AuthMethod::PrivateKey => {
                 if let Err(error) = clear_server_password(&normalized) {
-                    eprintln!("为 {} 清理安全凭据失败: {error:#}", normalized.endpoint());
+                    eprintln!("{} 清理安全凭据失败: {error:#}", normalized.endpoint());
                 }
                 normalized.password = None;
                 normalized.password_in_keyring = false;
