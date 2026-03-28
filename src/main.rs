@@ -15,12 +15,12 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 960.0])
             .with_min_inner_size([1180.0, 760.0])
-            .with_app_id("ink_garden_ssh"),
+            .with_app_id("berry_ssh_terminal"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "墨园 SSH",
+        "\u{8393}\u{8393}SSH\u{7ec8}\u{7aef}",
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, servers)))),
     )

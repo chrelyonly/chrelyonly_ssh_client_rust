@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow, bail};
 use chrono::{Local, TimeZone};
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Mesh,
-    RichText, Shadow, Stroke, TextEdit, TextStyle, pos2, vec2,
+    RichText, Shadow, Stroke, TextEdit, TextStyle, pos2, text::{LayoutJob, TextFormat}, vec2,
 };
 use egui_extras::{Size, StripBuilder};
 use egui_notify::{Anchor as ToastAnchor, Toasts};
@@ -29,7 +29,7 @@ use crate::history::history::{
     save_connection_history, save_scripts, save_shortcuts,
 };
 use crate::security::secrets::store_server_password;
-use crate::ssh::connect::{ManagedSession, SessionEvent, SessionHandle, connect_ssh};
+use crate::ssh::connect::{AuthPromptSpec, ManagedSession, SessionEvent, SessionHandle, connect_ssh};
 use crate::ssh::sftp::{
     RemoteFileEntry, create_dir as sftp_create_dir, download_file as sftp_download_file,
     join_remote_path as join_sftp_path, list_dir as sftp_list_dir,
@@ -45,6 +45,7 @@ const HISTORY_GROUP_LIMIT: usize = 8;
 
 const BODY_FONT_NAME: &str = "ui_body";
 const DISPLAY_FONT_NAME: &str = "display";
+const TERMINAL_FONT_NAME: &str = "terminal_ui";
 const BACKGROUND_IMAGE_BYTES: &[u8] = include_bytes!("../resource/image/bg.jpg");
 
 const BUILTIN_SHORTCUTS: [(&str, &str, &str); 5] = [
@@ -142,7 +143,7 @@ impl Tab {
             TabState::Disconnected => " (已关闭)",
             TabState::Failed => " (失败)",
         };
-        format!("{unread}{}{}", self.title, suffix)
+        format!("{unread}{} · #{}{}", self.title, self.id, suffix)
     }
 
     fn push_output(&mut self, text: &str) {
@@ -170,6 +171,10 @@ impl Tab {
 
     fn push_system_message(&mut self, message: &str) {
         self.push_output(&format!("\n# {message}\n"));
+    }
+
+    fn terminal_identity(&self) -> String {
+        format!("{}@{}", self.server.user, self.server.host)
     }
 
     fn status_color(&self, palette: &ThemePalette) -> Color32 {
@@ -240,6 +245,14 @@ struct FlashMessage {
     created_at: Instant,
 }
 
+struct AuthPromptDialog {
+    tab_id: usize,
+    title: String,
+    instructions: String,
+    prompts: Vec<AuthPromptSpec>,
+    responses: Vec<String>,
+}
+
 impl Default for FlashMessage {
     fn default() -> Self {
         Self {
@@ -291,8 +304,13 @@ impl Default for ServerForm {
 
 impl ServerForm {
     fn build_server(&self) -> Result<Server> {
-        let host = self.host.trim();
-        let user = self.user.trim();
+        let parsed_target = parse_ssh_target(self.host.trim());
+        let host = parsed_target.host.as_str();
+        let user = if self.user.trim().is_empty() {
+            parsed_target.user.as_deref().unwrap_or("")
+        } else {
+            self.user.trim()
+        };
         if host.is_empty() {
             bail!("请输入主机地址。");
         }
@@ -305,6 +323,7 @@ impl ServerForm {
             .trim()
             .parse()
             .map_err(|_| anyhow!("端口必须是有效数字。"))?;
+        let port = parsed_target.port.unwrap_or(port);
         let connect_timeout_secs: u64 = self
             .connect_timeout_secs
             .trim()
@@ -673,6 +692,7 @@ pub struct App {
     editing_script_name: Option<String>,
     show_sync_dialog: bool,
     show_server_editor_dialog: bool,
+    auth_prompt_dialog: Option<AuthPromptDialog>,
     pending_delete_server: Option<Server>,
     home_page: HomePage,
     resource_tab: ResourceTab,
@@ -728,9 +748,10 @@ impl App {
             editing_script_name: None,
             show_sync_dialog: false,
             show_server_editor_dialog: false,
+            auth_prompt_dialog: None,
             pending_delete_server: None,
             home_page: HomePage::Hosts,
-            resource_tab: ResourceTab::Overview,
+            resource_tab: ResourceTab::Commands,
             file_transfer: FileTransferPanel::new(),
             file_transfer_tx,
             file_transfer_events,
@@ -808,9 +829,20 @@ impl App {
         self.pending_delete_server = Some(server);
     }
 
+    fn clear_auth_prompt_for_tab(&mut self, tab_id: usize) {
+        if self
+            .auth_prompt_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.tab_id == tab_id)
+        {
+            self.auth_prompt_dialog = None;
+        }
+    }
+
     fn has_modal_open(&self) -> bool {
         self.show_sync_dialog
             || self.show_server_editor_dialog
+            || self.auth_prompt_dialog.is_some()
             || self.pending_delete_server.is_some()
     }
 
@@ -1611,10 +1643,39 @@ impl App {
         self.record_connection(&server);
         self.tabs[index].prepare_for_new_session(handle, events);
         self.active_tab = index;
+        self.resource_tab = ResourceTab::Commands;
     }
 
+    fn focus_existing_session_tab(&mut self, server_key: &str) -> bool {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .rposition(|tab| tab.server.server_key() == server_key)
+        else {
+            return false;
+        };
+
+        self.active_tab = index;
+        self.tabs[index].unseen_output = false;
+        true
+    }
+
+    fn open_session_tab(&mut self, server: Server) {
+        let ManagedSession { handle, events } = connect_ssh(self.runtime.clone(), server.clone());
+        self.record_connection(&server);
+
+        let tab = Tab::new(self.next_tab_id, server, handle, events);
+        self.next_tab_id += 1;
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len().saturating_sub(1);
+        self.resource_tab = ResourceTab::Commands;
+    }
+
+    #[allow(unreachable_code)]
     fn connect_to_server(&mut self, server: Server) {
         self.home_page = HomePage::Hosts;
+        self.open_session_tab(server.clone());
+        return;
         let existing_tab = self
             .tabs
             .iter()
@@ -1643,11 +1704,15 @@ impl App {
         self.next_tab_id += 1;
         self.tabs.push(tab);
         self.active_tab = self.tabs.len().saturating_sub(1);
+        self.resource_tab = ResourceTab::Commands;
     }
 
     fn close_tab(&mut self, index: usize) {
         if let Some(tab) = self.tabs.get(index) {
-            let _ = tab.session.disconnect();
+            let tab_id = tab.id;
+            let session = tab.session.clone();
+            self.clear_auth_prompt_for_tab(tab_id);
+            let _ = session.disconnect();
         }
         if index < self.tabs.len() {
             self.tabs.remove(index);
@@ -1676,6 +1741,9 @@ impl App {
     fn apply_session_event(&mut self, index: usize, event: SessionEvent) {
         let is_active = index == self.active_tab;
         let tab = &mut self.tabs[index];
+        let tab_id = tab.id;
+        let mut pending_auth_prompt: Option<AuthPromptDialog> = None;
+        let mut clear_auth_prompt = false;
 
         match event {
             SessionEvent::Status(message) => {
@@ -1690,6 +1758,7 @@ impl App {
                 tab.retry_delay_secs = None;
                 tab.status_text = message.clone();
                 tab.push_system_message(&message);
+                clear_auth_prompt = true;
             }
             SessionEvent::Retrying {
                 message,
@@ -1702,12 +1771,33 @@ impl App {
                 tab.retry_delay_secs = Some(delay_secs);
                 tab.status_text = message.clone();
                 tab.push_system_message(&message);
+                clear_auth_prompt = true;
             }
             SessionEvent::Output(output) => {
-                tab.push_output(&output);
-                if !is_active {
+                let text = terminal_text_from_bytes(&output);
+                if !text.is_empty() {
+                    tab.push_output(&text);
+                }
+                if !is_active && !output.is_empty() {
                     tab.unseen_output = true;
                 }
+            }
+            SessionEvent::AuthPrompt {
+                title,
+                instructions,
+                prompts,
+            } => {
+                tab.status_text = title.clone();
+                if !instructions.trim().is_empty() {
+                    tab.push_system_message(&instructions);
+                }
+                pending_auth_prompt = Some(AuthPromptDialog {
+                    tab_id,
+                    title,
+                    instructions,
+                    responses: vec![String::new(); prompts.len()],
+                    prompts,
+                });
             }
             SessionEvent::Error(message) => {
                 tab.state = TabState::Failed;
@@ -1715,6 +1805,7 @@ impl App {
                 tab.retry_delay_secs = None;
                 tab.status_text = message.clone();
                 tab.push_system_message(&format!("ERROR: {message}"));
+                clear_auth_prompt = true;
                 if !is_active {
                     tab.unseen_output = true;
                 }
@@ -1727,7 +1818,15 @@ impl App {
                 tab.retry_delay_secs = None;
                 tab.status_text = message.clone();
                 tab.push_system_message(&message);
+                clear_auth_prompt = true;
             }
+        }
+
+        if clear_auth_prompt {
+            self.clear_auth_prompt_for_tab(tab_id);
+        }
+        if let Some(dialog) = pending_auth_prompt {
+            self.auth_prompt_dialog = Some(dialog);
         }
     }
 
@@ -1852,6 +1951,10 @@ impl App {
                     modifiers,
                     ..
                 } => {
+                    if modifiers.mac_cmd {
+                        continue;
+                    }
+
                     let Some(bytes) = terminal_key_bytes(key, modifiers) else {
                         continue;
                     };
@@ -2090,7 +2193,67 @@ impl App {
             .default_width(292.0)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+                ui.label(
+                    RichText::new("连接主机")
+                        .font(self.display_font(22.0))
+                        .color(palette.text_primary),
+                );
+                ui.add(
+                    TextEdit::singleline(&mut self.search_query)
+                        .hint_text("搜索主机")
+                        .desired_width(f32::INFINITY),
+                );
+                if ui.button("新建连接").clicked() {
+                    self.open_new_server_dialog();
+                }
+                ui.separator();
 
+                if servers.is_empty() {
+                    let message = if self.servers.is_empty() {
+                        "还没有已保存的主机。"
+                    } else {
+                        "没有找到匹配的主机。"
+                    };
+                    ui.label(RichText::new(message).color(palette.text_secondary));
+                    return;
+                }
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for server in &servers {
+                            let server = server.clone();
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        false,
+                                        RichText::new(&server.name)
+                                            .strong()
+                                            .color(palette.text_primary),
+                                    )
+                                    .clicked()
+                                {
+                                    *pending_connect = Some(server.clone());
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("连接").clicked() {
+                                            *pending_connect = Some(server.clone());
+                                        }
+                                    },
+                                );
+                            });
+                            ui.label(
+                                RichText::new(server.endpoint())
+                                    .small()
+                                    .color(palette.text_secondary),
+                            );
+                            ui.separator();
+                        }
+                    });
+
+                if false {
                 card_frame(&palette, palette.panel_soft, 12).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
@@ -2153,6 +2316,7 @@ impl App {
                             ui.add_space(8.0);
                         }
                     });
+                }
             });
     }
 
@@ -2176,7 +2340,8 @@ impl App {
             let tab = &mut self.tabs[active_index];
             tab.unseen_output = false;
 
-            card_frame(palette, palette.panel, 14).show(ui, |ui| {
+            if false {
+                card_frame(palette, palette.panel, 14).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(&tab.title)
@@ -2199,6 +2364,7 @@ impl App {
                     stat_chip(ui, palette, "尝试", tab.connection_attempt.to_string());
                     stat_chip(ui, palette, "重连", tab.reconnect_count.to_string());
                     stat_chip(ui, palette, "在线时长", tab.uptime_text());
+                    stat_chip(ui, palette, "SHELL", tab.terminal_identity());
                     if let Some(delay_secs) = tab.retry_delay_secs {
                         stat_chip(ui, palette, "退避", format!("{delay_secs}s"));
                     }
@@ -2209,10 +2375,11 @@ impl App {
                         .small()
                         .color(palette.text_secondary),
                 );
-            });
+                });
+            }
 
             let available_height = ui.available_height();
-            let terminal_height = (available_height - 122.0).max(280.0);
+            let terminal_height = (available_height - 56.0).max(280.0);
             let full_size = ui.available_size_before_wrap();
             let cols = ((full_size.x.max(520.0) / 8.4).floor() as u32).max(DEFAULT_TERMINAL_COLS);
             let rows =
@@ -2230,6 +2397,14 @@ impl App {
                 }
             }
 
+            let terminal_identity = tab.terminal_identity();
+            let show_cursor = terminal_has_focus
+                && matches!(tab.state, TabState::Connected)
+                && ((ctx.input(|input| input.time) * 2.0).floor() as i64 % 2 == 0);
+            if terminal_has_focus {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+
             egui::Frame::new()
                 .fill(palette.terminal_bg)
                 .stroke(Stroke::new(
@@ -2244,21 +2419,44 @@ impl App {
                 .inner_margin(Margin::same(14))
                 .show(ui, |ui| {
                     ui.set_min_height(terminal_height);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("●").color(Color32::from_rgb(255, 120, 118)));
+                        ui.label(RichText::new("●").color(Color32::from_rgb(255, 202, 88)));
+                        ui.label(RichText::new("●").color(Color32::from_rgb(94, 214, 113)));
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(&terminal_identity)
+                                .small()
+                                .monospace()
+                                .color(palette.text_secondary),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
                     egui::ScrollArea::vertical()
                         .id_salt(("terminal_scroll", tab.id))
                         .stick_to_bottom(tab.auto_scroll)
                         .auto_shrink([false, false])
                         .max_height(terminal_height)
                         .show(ui, |ui| {
-                            ui.add_sized(
-                                [ui.available_width(), terminal_height],
-                                TextEdit::multiline(&mut tab.terminal_content)
-                                    .font(TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .frame(false)
-                                    .interactive(false)
-                                    .text_color(palette.terminal_text),
+                            let mut layout_job = build_terminal_layout_job(
+                                &tab.terminal_content,
+                                palette,
+                                &terminal_identity,
+                                show_cursor,
                             );
+                            layout_job.wrap.max_width = ui.available_width();
+                            ui.set_width(ui.available_width());
+                            let terminal_response = ui.add(
+                                egui::Label::new(layout_job)
+                                    .selectable(true)
+                                    .sense(egui::Sense::click_and_drag()),
+                            );
+                            if terminal_response.clicked() || terminal_response.drag_started() {
+                                ui.memory_mut(|mem| mem.request_focus(terminal_widget_id));
+                                tab.auto_scroll = true;
+                            }
                         });
 
                     let terminal_rect = ui.min_rect();
@@ -2308,6 +2506,13 @@ impl App {
                         }
                     }
                     ui.separator();
+                    badge(
+                        ui,
+                        palette,
+                        &terminal_identity,
+                        palette.accent_soft,
+                        palette.accent,
+                    );
                     ui.label(
                         RichText::new(if terminal_has_focus {
                             "Terminal focused: type directly here"
@@ -2449,6 +2654,96 @@ impl App {
             });
     }
 
+    fn draw_global_tabs_bar(&mut self, ctx: &egui::Context, pending_close: &mut Option<usize>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        egui::TopBottomPanel::top("session_tabs_bar_v2")
+            .resizable(false)
+            .show(ctx, |ui| {
+                let palette = self.palette();
+                card_frame(&palette, palette.panel, 12).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("莓莓SSH终端 · {} 个会话", self.tabs.len()))
+                                .small()
+                                .color(palette.text_secondary),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if let Some(active) = self.tabs.get(self.active_tab) {
+                                    badge(
+                                        ui,
+                                        &palette,
+                                        &active.server.endpoint(),
+                                        palette.panel_alt,
+                                        palette.text_secondary,
+                                    );
+                                }
+                            },
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for index in 0..self.tabs.len() {
+                                    let selected = index == self.active_tab;
+                                    let title = self.tabs[index].title_for_tab();
+                                    egui::Frame::new()
+                                        .fill(if selected {
+                                            palette.accent_soft
+                                        } else {
+                                            palette.panel_alt.linear_multiply(0.94)
+                                        })
+                                        .stroke(Stroke::new(
+                                            if selected { 1.35 } else { 1.0 },
+                                            if selected { palette.accent } else { palette.stroke },
+                                        ))
+                                        .corner_radius(CornerRadius::same(16))
+                                        .inner_margin(Margin::symmetric(12, 9))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                let response = ui.add(
+                                                    egui::Button::new(
+                                                        RichText::new(title)
+                                                            .small()
+                                                            .strong()
+                                                            .color(palette.text_primary),
+                                                    )
+                                                    .frame(false),
+                                                );
+                                                if response.clicked() {
+                                                    self.active_tab = index;
+                                                    self.tabs[index].unseen_output = false;
+                                                }
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("x")
+                                                                .small()
+                                                                .color(palette.text_muted),
+                                                        )
+                                                        .frame(false),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    *pending_close = Some(index);
+                                                }
+                                            });
+                                        });
+                                    ui.add_space(6.0);
+                                }
+                            });
+                        });
+                });
+            });
+    }
+
     fn draw_modal_backdrop(&self, ctx: &egui::Context) {
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
@@ -2532,7 +2827,10 @@ impl App {
                         ui.end_row();
 
                         ui.label("主机");
-                        ui.add(TextEdit::singleline(&mut self.server_form.host));
+                        ui.add(
+                            TextEdit::singleline(&mut self.server_form.host)
+                                .hint_text("host or root@host"),
+                        );
                         ui.end_row();
 
                         ui.label("端口");
@@ -2591,6 +2889,84 @@ impl App {
                 });
             });
         self.show_server_editor_dialog = open;
+    }
+
+    fn draw_auth_prompt_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.auth_prompt_dialog.take() else {
+            return;
+        };
+
+        let palette = self.palette();
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+
+        egui::Window::new(dialog.title.clone())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+
+                if !dialog.instructions.trim().is_empty() {
+                    ui.label(
+                        RichText::new(dialog.instructions.clone())
+                            .small()
+                            .color(palette.text_secondary),
+                    );
+                    ui.add_space(10.0);
+                }
+
+                for (index, prompt) in dialog.prompts.iter().enumerate() {
+                    ui.label(prompt.prompt.trim());
+                    ui.add(
+                        TextEdit::singleline(&mut dialog.responses[index])
+                            .password(!prompt.echo)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(8.0);
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Submit").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if !open {
+            cancel = true;
+        }
+
+        if submit {
+            let tab_id = dialog.tab_id;
+            let responses = dialog.responses.clone();
+            if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
+                match self.tabs[index].session.submit_auth_prompt(responses) {
+                    Ok(()) => {
+                        self.tabs[index]
+                            .push_system_message("Authentication response submitted.");
+                    }
+                    Err(error) => {
+                        let message = format!("Failed to submit authentication response: {error}");
+                        self.tabs[index].push_system_message(&message);
+                        self.set_flash(message, true);
+                        self.auth_prompt_dialog = Some(dialog);
+                    }
+                }
+            }
+        } else if cancel {
+            if let Some(index) = self.tabs.iter().position(|tab| tab.id == dialog.tab_id) {
+                let _ = self.tabs[index].session.disconnect();
+                self.tabs[index].push_system_message("Authentication was cancelled from the UI.");
+            }
+        } else {
+            self.auth_prompt_dialog = Some(dialog);
+        }
     }
 
     fn draw_delete_server_dialog(&mut self, ctx: &egui::Context) {
@@ -2856,6 +3232,7 @@ impl App {
 
         let mut pending_edit: Option<Server> = None;
         let mut pending_delete: Option<Server> = None;
+        let mut pending_focus_server_key: Option<String> = None;
 
         card_frame(palette, palette.panel, 18).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -2974,10 +3351,12 @@ impl App {
                         let mut color_index = 0usize;
                         for servers in grouped.values() {
                             for server in servers {
-                                let already_open = self
+                                let open_tabs = self
                                     .tabs
                                     .iter()
-                                    .any(|tab| tab.server.server_key() == server.server_key());
+                                    .filter(|tab| tab.server.server_key() == server.server_key())
+                                    .count();
+                                let already_open = open_tabs > 0;
                                 let tint = host_card_tint(palette, color_index);
                                 color_index += 1;
 
@@ -3031,6 +3410,15 @@ impl App {
                                                                     palette.accent_soft,
                                                                     palette.text_primary,
                                                                 );
+                                                                ui.label(
+                                                                    RichText::new("new click opens another tab")
+                                                                        .small()
+                                                                        .color(palette.text_muted),
+                                                                );
+                                                                if ui.small_button("focus latest").clicked() {
+                                                                    pending_focus_server_key =
+                                                                        Some(server.server_key());
+                                                                }
                                                             }
                                                         },
                                                     );
@@ -3093,6 +3481,9 @@ impl App {
         }
         if let Some(server) = pending_delete {
             self.request_server_delete(server);
+        }
+        if let Some(server_key) = pending_focus_server_key {
+            let _ = self.focus_existing_session_tab(&server_key);
         }
     }
 
@@ -3167,48 +3558,14 @@ impl App {
                 return;
             }
 
-            let full_size = ui.available_size_before_wrap();
-            let max_resource_width = (full_size.x - 520.0).max(360.0);
-            let resource_width = (full_size.x * 0.35)
-                .clamp(360.0, 520.0)
-                .min(max_resource_width);
-
-            // Use StripBuilder so the main workspace split stays predictable as we add more panes.
-            StripBuilder::new(ui)
-                .size(Size::exact(resource_width))
-                .size(Size::exact(18.0))
-                .size(Size::remainder().at_least(420.0))
-                .horizontal(|mut strip| {
-                    strip.cell(|ui| {
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                self.draw_resource_workspace(
-                                    ui,
-                                    ctx,
-                                    pending_connect,
-                                    pending_run_command,
-                                    &palette,
-                                );
-                            });
-                    });
-
-                    strip.cell(|ui| {
-                        ui.add_space(6.0);
-                        ui.separator();
-                    });
-
-                    strip.cell(|ui| {
-                        self.draw_terminal_shell(
-                            ui,
-                            ctx,
-                            pending_send_command,
-                            pending_restart_active_tab,
-                            pending_pin_shortcut,
-                            &palette,
-                        );
-                    });
-                });
+            self.draw_terminal_shell(
+                ui,
+                ctx,
+                pending_send_command,
+                pending_restart_active_tab,
+                pending_pin_shortcut,
+                &palette,
+            );
         });
     }
 
@@ -4052,7 +4409,7 @@ impl App {
                                     .font(TextStyle::Monospace)
                                     .desired_width(f32::INFINITY)
                                     .frame(false)
-                                    .interactive(false)
+                                    .interactive(true)
                                     .text_color(palette.terminal_text),
                             );
                         });
@@ -4216,7 +4573,7 @@ impl App {
                 texture.id(),
                 rect,
                 egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::from_rgba_premultiplied(255, 255, 255, 92),
+                Color32::from_rgba_premultiplied(255, 255, 255, 148),
             );
         }
 
@@ -4347,7 +4704,7 @@ impl eframe::App for App {
 
         self.draw_shell_top_bar(ctx);
         self.draw_shell_sidebar(ctx, &mut pending_connect);
-        self.draw_tabs_bar(ctx, &mut pending_close);
+        self.draw_global_tabs_bar(ctx, &mut pending_close);
         self.draw_workspace(
             ctx,
             &mut pending_connect,
@@ -4361,6 +4718,7 @@ impl eframe::App for App {
         }
         self.draw_sync_dialog_modal(ctx);
         self.draw_server_editor_dialog_modal(ctx);
+        self.draw_auth_prompt_modal(ctx);
         self.draw_delete_server_dialog(ctx);
         self.toasts.show(ctx);
 
@@ -4389,6 +4747,7 @@ fn install_fonts(ctx: &egui::Context) -> bool {
     let mut fonts = FontDefinitions::default();
     let mut has_body_font = false;
     let mut has_display_font = false;
+    let mut has_terminal_font = false;
 
     // Prefer system CJK fonts so the app can render Chinese labels without bundling assets.
     if let Some(font) = load_font_data(&[
@@ -4404,6 +4763,19 @@ fn install_fonts(ctx: &egui::Context) -> bool {
             family.insert(0, BODY_FONT_NAME.to_owned());
         }
         has_body_font = true;
+    }
+
+    if let Some(font) = load_font_data(&[
+        ("C:\\Windows\\Fonts\\CascadiaMono.ttf", 0),
+        ("C:\\Windows\\Fonts\\consola.ttf", 0),
+        ("C:\\Windows\\Fonts\\msyh.ttc", 0),
+        ("/System/Library/Fonts/SFNSMono.ttf", 0),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0),
+    ]) {
+        fonts
+            .font_data
+            .insert(TERMINAL_FONT_NAME.to_owned(), Arc::new(font));
+        has_terminal_font = true;
     }
 
     if let Some(font) = load_font_data(&[
@@ -4428,6 +4800,25 @@ fn install_fonts(ctx: &egui::Context) -> bool {
             .families
             .insert(FontFamily::Name(DISPLAY_FONT_NAME.into()), display_family);
         has_display_font = true;
+    }
+
+    let mut terminal_family = Vec::new();
+    if has_terminal_font {
+        terminal_family.push(TERMINAL_FONT_NAME.to_owned());
+    }
+    if has_body_font {
+        terminal_family.push(BODY_FONT_NAME.to_owned());
+    }
+    if let Some(defaults) = fonts.families.get(&FontFamily::Monospace) {
+        terminal_family.extend(defaults.clone());
+    }
+    if !terminal_family.is_empty() {
+        fonts
+            .families
+            .insert(FontFamily::Name(TERMINAL_FONT_NAME.into()), terminal_family.clone());
+        fonts
+            .families
+            .insert(FontFamily::Monospace, terminal_family);
     }
 
     ctx.set_fonts(fonts);
@@ -4464,6 +4855,314 @@ fn load_background_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
         color_image,
         egui::TextureOptions::LINEAR,
     ))
+}
+
+struct ParsedSshTarget {
+    user: Option<String>,
+    host: String,
+    port: Option<u16>,
+}
+
+fn parse_ssh_target(target: &str) -> ParsedSshTarget {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return ParsedSshTarget {
+            user: None,
+            host: String::new(),
+            port: None,
+        };
+    }
+
+    let (user, host_port) = match trimmed.rsplit_once('@') {
+        Some((user, host_port)) if !user.trim().is_empty() && !host_port.trim().is_empty() => {
+            (Some(user.trim().to_string()), host_port.trim())
+        }
+        _ => (None, trimmed),
+    };
+
+    let mut host = host_port.trim().to_string();
+    let mut port = None;
+
+    if let Some(bracketed) = host_port.strip_prefix('[') {
+        if let Some(closing) = bracketed.find(']') {
+            host = bracketed[..closing].trim().to_string();
+            let remainder = &bracketed[closing + 1..];
+            if let Some(port_text) = remainder.strip_prefix(':') {
+                if let Ok(value) = port_text.trim().parse::<u16>() {
+                    port = Some(value);
+                }
+            }
+        }
+    } else if host_port.matches(':').count() == 1 {
+        if let Some((host_part, port_part)) = host_port.rsplit_once(':') {
+            if let Ok(value) = port_part.trim().parse::<u16>() {
+                host = host_part.trim().to_string();
+                port = Some(value);
+            }
+        }
+    }
+
+    ParsedSshTarget { user, host, port }
+}
+
+fn terminal_text_from_bytes(output: &[u8]) -> String {
+    let text = String::from_utf8_lossy(output);
+    let mut cleaned = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0;
+
+    while index < chars.len() {
+        match chars[index] {
+            '\u{1b}' => {
+                index += 1;
+                if index >= chars.len() {
+                    break;
+                }
+
+                match chars[index] {
+                    '[' => {
+                        index += 1;
+                        while index < chars.len() {
+                            let ch = chars[index];
+                            index += 1;
+                            if ('@'..='~').contains(&ch) {
+                                break;
+                            }
+                        }
+                    }
+                    ']' => {
+                        index += 1;
+                        while index < chars.len() {
+                            match chars[index] {
+                                '\u{0007}' => {
+                                    index += 1;
+                                    break;
+                                }
+                                '\u{1b}'
+                                    if chars.get(index + 1).copied() == Some('\\') =>
+                                {
+                                    index += 2;
+                                    break;
+                                }
+                                _ => index += 1,
+                            }
+                        }
+                    }
+                    _ => {
+                        index += 1;
+                    }
+                }
+            }
+            '\r' => {
+                if chars.get(index + 1).copied() == Some('\n') {
+                    cleaned.push('\n');
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            ch if ch.is_control() && ch != '\n' && ch != '\t' => {
+                index += 1;
+            }
+            ch => {
+                cleaned.push(ch);
+                index += 1;
+            }
+        }
+    }
+
+    cleaned
+}
+
+fn build_terminal_layout_job(
+    text: &str,
+    palette: &ThemePalette,
+    identity: &str,
+    show_cursor: bool,
+) -> LayoutJob {
+    let font_id = FontId::new(13.5, FontFamily::Name(TERMINAL_FONT_NAME.into()));
+    let mut job = LayoutJob::default();
+    let body_color = palette.terminal_text;
+
+    for line in text.split_inclusive('\n') {
+        append_terminal_line(&mut job, line, palette, identity, &font_id, body_color);
+    }
+
+    if !text.is_empty() && !text.ends_with('\n') {
+        append_terminal_line(&mut job, "", palette, identity, &font_id, body_color);
+    }
+
+    if show_cursor {
+        job.append(
+            "|",
+            0.0,
+            TextFormat {
+                font_id: font_id.clone(),
+                color: palette.accent,
+                line_height: Some(14.5),
+                ..Default::default()
+            },
+        );
+    }
+
+    job
+}
+
+fn append_terminal_line(
+    job: &mut LayoutJob,
+    line: &str,
+    palette: &ThemePalette,
+    identity: &str,
+    font_id: &FontId,
+    default_color: Color32,
+) {
+    if line.is_empty() {
+        return;
+    }
+
+    let content = line.strip_suffix('\n').unwrap_or(line);
+    let content_lower = content.to_ascii_lowercase();
+
+    if content.trim_start().starts_with("# ") {
+        append_terminal_span(job, line, font_id, palette.text_muted);
+        return;
+    }
+
+    let line_color = if ["error", "failed", "denied", "panic", "traceback"]
+        .iter()
+        .any(|needle| content_lower.contains(needle))
+    {
+        palette.danger
+    } else if ["warn", "warning"].iter().any(|needle| content_lower.contains(needle)) {
+        palette.warning
+    } else if ["success", "complete", "done", "started", "ready"]
+        .iter()
+        .any(|needle| content_lower.contains(needle))
+    {
+        palette.success
+    } else {
+        default_color
+    };
+
+    let mut token = String::new();
+    for ch in content.chars() {
+        if ch.is_whitespace() {
+            if !token.is_empty() {
+                let token_color =
+                    classify_terminal_token(&token, line_color, palette, identity, content);
+                append_terminal_span(job, &token, font_id, token_color);
+                token.clear();
+            }
+            let whitespace = ch.to_string();
+            append_terminal_span(job, &whitespace, font_id, line_color);
+        } else {
+            token.push(ch);
+        }
+    }
+
+    if !token.is_empty() {
+        let token_color = classify_terminal_token(&token, line_color, palette, identity, content);
+        append_terminal_span(job, &token, font_id, token_color);
+    }
+
+    if line.ends_with('\n') {
+        append_terminal_span(job, "\n", font_id, line_color);
+    }
+}
+
+fn classify_terminal_token(
+    token: &str,
+    line_color: Color32,
+    palette: &ThemePalette,
+    identity: &str,
+    full_line: &str,
+) -> Color32 {
+    let trimmed = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']'));
+    if trimmed.is_empty() {
+        return line_color;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let prompt_like = full_line.trim_start().starts_with(identity)
+        || full_line.trim_start().starts_with("root@")
+        || full_line.trim_start().contains("@");
+
+    if trimmed == identity || lower.starts_with("root@") || lower.contains("@localhost") {
+        return palette.accent;
+    }
+    if prompt_like && matches!(trimmed, "$" | "#" | ">" | "%") {
+        return palette.warning;
+    }
+    if trimmed.starts_with("~/") || trimmed.starts_with('/') || trimmed.starts_with("./") {
+        return palette.text_secondary;
+    }
+    if trimmed.starts_with("--") || (trimmed.starts_with('-') && trimmed.len() > 1) {
+        return palette.warning;
+    }
+    if matches!(
+        lower.as_str(),
+        "ssh"
+            | "sudo"
+            | "cd"
+            | "ls"
+            | "cat"
+            | "grep"
+            | "find"
+            | "tail"
+            | "less"
+            | "more"
+            | "vim"
+            | "nano"
+            | "systemctl"
+            | "journalctl"
+            | "docker"
+            | "kubectl"
+            | "git"
+            | "cargo"
+            | "rustc"
+            | "python"
+            | "python3"
+            | "pip"
+            | "npm"
+            | "pnpm"
+            | "yarn"
+            | "chmod"
+            | "chown"
+            | "mkdir"
+            | "rm"
+            | "cp"
+            | "mv"
+            | "top"
+            | "htop"
+            | "uname"
+            | "whoami"
+            | "echo"
+            | "export"
+    ) {
+        return palette.accent;
+    }
+    if lower.chars().all(|ch| ch.is_ascii_digit()) {
+        return palette.text_muted;
+    }
+
+    line_color
+}
+
+fn append_terminal_span(job: &mut LayoutJob, text: &str, font_id: &FontId, color: Color32) {
+    if text.is_empty() {
+        return;
+    }
+
+    job.append(
+        text,
+        0.0,
+        TextFormat {
+            font_id: font_id.clone(),
+            color,
+            line_height: Some(14.5),
+            ..Default::default()
+        },
+    );
 }
 
 fn terminal_key_bytes(key: egui::Key, modifiers: egui::Modifiers) -> Option<Vec<u8>> {
@@ -4653,7 +5352,7 @@ fn apply_theme(ctx: &egui::Context, preset: ThemePreset) {
     );
     style.text_styles.insert(
         TextStyle::Monospace,
-        FontId::new(15.0, FontFamily::Monospace),
+        FontId::new(13.5, FontFamily::Name(TERMINAL_FONT_NAME.into())),
     );
 
     ctx.set_style(style);

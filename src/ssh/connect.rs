@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use russh::client::{self, Config};
+use russh::client::{self, Config, KeyboardInteractiveAuthResponse};
 use russh::{ChannelMsg, Disconnect};
 use russh_keys::load_secret_key;
 use tokio::runtime::Runtime;
@@ -24,8 +24,17 @@ pub enum SessionCommand {
         height_px: u32,
     },
     Interrupt,
+    SubmitAuthPrompt {
+        responses: Vec<String>,
+    },
     ReconnectNow,
     Disconnect,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthPromptSpec {
+    pub prompt: String,
+    pub echo: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +49,12 @@ pub enum SessionEvent {
         attempt: u32,
         delay_secs: u64,
     },
-    Output(String),
+    Output(Vec<u8>),
+    AuthPrompt {
+        title: String,
+        instructions: String,
+        prompts: Vec<AuthPromptSpec>,
+    },
     Error(String),
     Disconnected(String),
 }
@@ -72,6 +86,12 @@ impl SessionHandle {
         self.command_tx
             .send(SessionCommand::Interrupt)
             .map_err(|_| anyhow!("SSH 会话已不可用"))
+    }
+
+    pub fn submit_auth_prompt(&self, responses: Vec<String>) -> Result<()> {
+        self.command_tx
+            .send(SessionCommand::SubmitAuthPrompt { responses })
+            .map_err(|_| anyhow!("SSH session is unavailable"))
     }
 
     pub fn reconnect_now(&self) -> Result<()> {
@@ -295,12 +315,16 @@ async fn run_connection_attempt(
     .with_context(|| format!("连接在 {} 秒后超时", policy.connect_timeout_secs))?
     .with_context(|| format!("无法连接到 {}:{}", server.host, server.port))?;
 
-    timeout(
+    let auth_outcome = timeout(
         connect_timeout,
-        authenticate_server(server, &mut session, event_tx),
+        authenticate_server(server, &mut session, command_rx, event_tx),
     )
     .await
     .with_context(|| format!("认证在 {} 秒后超时", policy.connect_timeout_secs))??;
+
+    if let Some(outcome) = auth_outcome {
+        return Ok(outcome);
+    }
 
     let mut channel = timeout(connect_timeout, session.channel_open_session())
         .await
@@ -368,6 +392,12 @@ async fn run_connection_attempt(
                             .await
                             .context("向远端 Shell 发送 Ctrl+C 失败")?;
                     }
+                    Some(SessionCommand::SubmitAuthPrompt { .. }) => {
+                        send_event(
+                            event_tx,
+                            SessionEvent::Status("Authentication has already completed.".to_string()),
+                        );
+                    }
                     Some(SessionCommand::ReconnectNow) => {
                         let _ = channel.eof().await;
                         let _ = channel.close().await;
@@ -395,15 +425,13 @@ async fn run_connection_attempt(
             maybe_message = channel.wait() => {
                 match maybe_message {
                     Some(ChannelMsg::Data { data }) => {
-                        let output = sanitize_terminal_text(data.as_ref());
-                        if !output.is_empty() {
-                            send_event(event_tx, SessionEvent::Output(output));
+                        if !data.is_empty() {
+                            send_event(event_tx, SessionEvent::Output(data.to_vec()));
                         }
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        let output = sanitize_terminal_text(data.as_ref());
-                        if !output.is_empty() {
-                            send_event(event_tx, SessionEvent::Output(output));
+                        if !data.is_empty() {
+                            send_event(event_tx, SessionEvent::Output(data.to_vec()));
                         }
                     }
                     Some(ChannelMsg::Success) => {}
@@ -460,6 +488,7 @@ async fn wait_for_retry_window(
                     Some(SessionCommand::Resize { cols, rows, width_px, height_px }) => {
                         *terminal_size = TerminalSize::new(cols, rows, width_px, height_px);
                     }
+                    Some(SessionCommand::SubmitAuthPrompt { .. }) => {}
                     Some(SessionCommand::ReconnectNow) => {
                         return RetryGateOutcome::ContinueImmediately;
                     }
@@ -487,12 +516,13 @@ async fn wait_for_retry_window(
 async fn authenticate_server(
     server: &Server,
     session: &mut client::Handle<SSHClient>,
+    command_rx: &mut UnboundedReceiver<SessionCommand>,
     event_tx: &UnboundedSender<SessionEvent>,
-) -> Result<()> {
+) -> Result<Option<SessionOutcome>> {
     send_event(
         event_tx,
         SessionEvent::Status(format!(
-            "正在以 {} 身份使用{}认证...",
+            "Authenticating as {} via {}...",
             server.user,
             server.auth_method.label()
         )),
@@ -500,25 +530,37 @@ async fn authenticate_server(
 
     match server.auth_method {
         AuthMethod::Password => {
-            let password = match server
+            let stored_password = server
                 .password
                 .as_deref()
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
+                .or_else(|| load_server_password(server).ok().flatten())
+                .filter(|value| !value.is_empty());
+
+            if let Some(password) = stored_password.clone() {
+                let auth_result = session
+                    .authenticate_password(server.user.clone(), password)
+                    .await
+                    .context("failed to start password authentication")?;
+
+                if auth_result {
+                    send_event(event_tx, SessionEvent::Status("Authentication succeeded.".to_string()));
+                    append_server_event(server, "authentication_succeeded", "password");
+                    return Ok(None);
+                }
+            }
+
+            if let Some(outcome) = authenticate_keyboard_interactive(
+                server,
+                stored_password,
+                session,
+                command_rx,
+                event_tx,
+            )
+            .await?
             {
-                Some(password) => password,
-                None => load_server_password(server)?
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow!("密码认证需要先配置密码"))?,
-            };
-
-            let auth_result = session
-                .authenticate_password(server.user.clone(), password)
-                .await
-                .context("发起密码认证请求失败")?;
-
-            if !auth_result {
-                bail!("用户 {} 的密码认证失败", server.user);
+                return Ok(Some(outcome));
             }
         }
         AuthMethod::PrivateKey => {
@@ -526,28 +568,147 @@ async fn authenticate_server(
                 .private_key_path
                 .as_deref()
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow!("私钥认证需要填写密钥路径"))?;
+                .ok_or_else(|| anyhow!("A private key path is required for key authentication."))?;
 
             let private_key = load_secret_key(private_key_path, None)
-                .with_context(|| format!("加载私钥失败：{private_key_path}"))?;
+                .with_context(|| format!("Failed to load private key from {private_key_path}"))?;
 
             let auth_result = session
                 .authenticate_publickey(server.user.clone(), Arc::new(private_key))
                 .await
-                .context("发起私钥认证请求失败")?;
+                .context("failed to start public key authentication")?;
 
             if !auth_result {
-                bail!("用户 {} 的私钥认证失败", server.user);
+                bail!("Public key authentication failed for user {}", server.user);
             }
         }
     }
 
-    send_event(event_tx, SessionEvent::Status("认证成功。".to_string()));
-    append_server_event(server, "认证成功", "SSH 认证成功。");
+    send_event(event_tx, SessionEvent::Status("Authentication succeeded.".to_string()));
+    append_server_event(server, "authentication_succeeded", server.auth_method.label());
 
-    Ok(())
+    Ok(None)
 }
 
+enum AuthPromptResolution {
+    Responses(Vec<String>),
+    Outcome(SessionOutcome),
+}
+
+async fn authenticate_keyboard_interactive(
+    server: &Server,
+    stored_password: Option<String>,
+    session: &mut client::Handle<SSHClient>,
+    command_rx: &mut UnboundedReceiver<SessionCommand>,
+    event_tx: &UnboundedSender<SessionEvent>,
+) -> Result<Option<SessionOutcome>> {
+    let mut response = session
+        .authenticate_keyboard_interactive_start(server.user.clone(), None)
+        .await
+        .context("failed to start keyboard-interactive authentication")?;
+
+    loop {
+        match response {
+            KeyboardInteractiveAuthResponse::Success => return Ok(None),
+            KeyboardInteractiveAuthResponse::Failure => {
+                bail!("Authentication failed for user {}", server.user);
+            }
+            KeyboardInteractiveAuthResponse::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
+                let maybe_auto = stored_password
+                    .as_ref()
+                    .filter(|_| prompts.len() == 1 && prompts.iter().all(|prompt| !prompt.echo))
+                    .map(|password| vec![password.clone()]);
+
+                let responses = if let Some(responses) = maybe_auto {
+                    responses
+                } else {
+                    let prompt_specs: Vec<AuthPromptSpec> = prompts
+                        .into_iter()
+                        .map(|prompt| AuthPromptSpec {
+                            prompt: prompt.prompt,
+                            echo: prompt.echo,
+                        })
+                        .collect();
+
+                    send_event(
+                        event_tx,
+                        SessionEvent::AuthPrompt {
+                            title: if name.trim().is_empty() {
+                                "Authentication Required".to_string()
+                            } else {
+                                name
+                            },
+                            instructions,
+                            prompts: prompt_specs.clone(),
+                        },
+                    );
+
+                    match wait_for_auth_prompt_response(prompt_specs.len(), command_rx, event_tx).await {
+                        AuthPromptResolution::Responses(responses) => responses,
+                        AuthPromptResolution::Outcome(outcome) => return Ok(Some(outcome)),
+                    }
+                };
+
+                response = session
+                    .authenticate_keyboard_interactive_respond(responses)
+                    .await
+                    .context("failed to answer the interactive authentication prompts")?;
+            }
+        }
+    }
+}
+
+async fn wait_for_auth_prompt_response(
+    expected_prompts: usize,
+    command_rx: &mut UnboundedReceiver<SessionCommand>,
+    event_tx: &UnboundedSender<SessionEvent>,
+) -> AuthPromptResolution {
+    loop {
+        match command_rx.recv().await {
+            Some(SessionCommand::SubmitAuthPrompt { responses }) => {
+                if responses.len() == expected_prompts {
+                    return AuthPromptResolution::Responses(responses);
+                }
+
+                send_event(
+                    event_tx,
+                    SessionEvent::Status(format!(
+                        "Waiting for {expected_prompts} authentication field(s)."
+                    )),
+                );
+            }
+            Some(SessionCommand::Resize { .. }) => {}
+            Some(SessionCommand::Send(_)) | Some(SessionCommand::Interrupt) => {
+                send_event(
+                    event_tx,
+                    SessionEvent::Status(
+                        "Complete the authentication prompt before sending terminal input."
+                            .to_string(),
+                    ),
+                );
+            }
+            Some(SessionCommand::ReconnectNow) => {
+                return AuthPromptResolution::Outcome(SessionOutcome::ReconnectNow(
+                    "Authentication restarted by the user.".to_string(),
+                ));
+            }
+            Some(SessionCommand::Disconnect) => {
+                return AuthPromptResolution::Outcome(SessionOutcome::UserDisconnected(
+                    "Authentication cancelled by the user.".to_string(),
+                ));
+            }
+            None => {
+                return AuthPromptResolution::Outcome(SessionOutcome::UiDetached(
+                    "Authentication prompt closed with the UI.".to_string(),
+                ));
+            }
+        }
+    }
+}
 fn should_retry(policy: &ConnectionPolicy, attempt: u32) -> bool {
     policy.auto_reconnect && attempt.saturating_sub(1) < policy.max_reconnect_attempts
 }
