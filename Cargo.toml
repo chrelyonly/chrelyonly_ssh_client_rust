@@ -4,3 +4,37 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+russh = "0.43"
+russh-keys = "0.43"
+russh-sftp = "2.1.1"
+futures = "0.3"
+
+ratatui = "0.26"
+crossterm = "0.27"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+dirs = "5"
+anyhow = "1"
+config = "0.15.21"
+async-trait = "0.1"
+eframe = "0.33.3"
+egui = "0.33.3"
+egui_extras = "0.33.3"
+egui-notify = "0.21.0"
+chrono = "0.4.31"
+sha2 = "0.10"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+keyring = { version = "3.6.3", features = ["sync-secret-service"] }
