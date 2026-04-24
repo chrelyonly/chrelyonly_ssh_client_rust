@@ -7,7 +7,7 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 
-russh = "0.43"
+russh = "0.60"
 russh-keys = "0.43"
 russh-sftp = "2.1.1"
 futures = "0.3"
